@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.so
+.env
+
+# OS
+.DS_Store
+
+# IDE / Editors
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+
+# AI Agents
+.claude/
+
+# Calibration data (user-specific, may contain sensitive paths)
+.memory-guard/
