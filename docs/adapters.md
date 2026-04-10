@@ -1,6 +1,7 @@
 # Framework Adapters — Reference Guide
 
-*Added in v0.2.0 (`pip install ml-memguard[hf]` / `pip install ml-memguard[unsloth]`)*
+*Training adapters added in v0.2.0 (`pip install ml-memguard[hf]` / `pip install ml-memguard[unsloth]`)*  
+*Inference serving adapters added in v0.3.0 (`pip install ml-memguard[vllm]` / `pip install ml-memguard[sglang]`)*
 
 ---
 
@@ -20,6 +21,9 @@ from memory_guard import guard_trainer          # HF Transformers
 from memory_guard import guard_unsloth_model   # Unsloth
 from memory_guard import guard_sft_trainer     # TRL SFTTrainer
 from memory_guard import MemoryGuardCallback   # HF callback (advanced use)
+
+from memory_guard import guard_vllm            # vLLM inference serving
+from memory_guard import guard_sglang          # SGLang inference serving
 ```
 
 ---
@@ -225,9 +229,121 @@ trainer.train()
 
 ---
 
+---
+
+## Inference Serving Adapters (v0.3.0)
+
+These adapters integrate with serving frameworks.  They never mutate a running
+engine — all load-shedding is delegated to the caller via callbacks (ADR 003).
+
+### `guard_vllm(llm, ...) -> (InferenceSafeConfig, KVCacheMonitor)`
+
+**Install**: `pip install ml-memguard[vllm]`  
+**Module**: `memory_guard.adapters.vllm`
+
+```python
+from vllm import LLM
+from memory_guard import guard_vllm
+
+llm = LLM(model="meta-llama/Meta-Llama-3-8B", ...)
+
+safe, monitor = guard_vllm(
+    llm,
+    on_shed_load=lambda u: load_balancer.reduce_weight("primary", 0),
+)
+print(safe.max_num_seqs)            # pass to vLLM --max-num-seqs
+print(safe.gpu_memory_utilization)  # pass to vLLM --gpu-memory-utilization
+
+with monitor.session():
+    server.serve_forever()
+```
+
+**Accepted types**: `vllm.LLM` (has `.llm_engine`), `vllm.AsyncLLMEngine`
+(has `.engine`), bare `vllm.LLMEngine`.
+
+**Architecture detection** — reads from `engine.model_config.hf_config`:
+
+| Field | Source |
+|---|---|
+| `num_kv_heads` | `hf_config.num_key_value_heads` → falls back to `num_attention_heads` |
+| `head_dim` | `hf_config.hidden_size // num_attention_heads` |
+| `num_layers` | `hf_config.num_hidden_layers` |
+| `max_seq_len` | `model_config.max_model_len` |
+| `dtype_bytes` | `model_config.dtype` (fp16/bf16 → 2, fp32 → 4, int8 → 1) |
+| `model_bits` | `model_config.quantization` (awq/gptq/fp8 → 4, bnb/smooth → 8, else 16) |
+| `model_params` | `hf_config.num_parameters` → else 12 × H² × L estimate |
+
+**Poll path**: `engine.scheduler.block_manager.get_num_free_gpu_blocks()` and
+`.get_num_total_gpu_blocks()`.  Falls back to null utilization (returns `(0, 1)`)
+if the block manager is not accessible, with a one-time warning.
+
+**Parameters**:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `available_mb` | auto (CUDA) | Override GPU memory for preflight |
+| `max_num_seqs` | from `scheduler_config` | Max concurrent requests |
+| `max_seq_len` | from `model_config` | Max sequence length |
+| `on_warning` | None | Callback at ≥ 80 % KV cache utilization |
+| `on_shed_load` | None | Callback at ≥ 92 % KV cache utilization |
+| `poll_interval` | 5.0 s | Background poll frequency |
+| `cooldown_seconds` | 30.0 s | Min gap between repeated callback firings |
+| `safety_ratio` | 0.80 | Fraction of available memory used as budget |
+| `min_num_seqs` | 1 | Binary-search floor |
+
+---
+
+### `guard_sglang(engine, ...) -> (InferenceSafeConfig, KVCacheMonitor)`
+
+**Install**: `pip install ml-memguard[sglang]`  
+**Module**: `memory_guard.adapters.sglang`
+
+```python
+import sglang as sgl
+from memory_guard import guard_sglang
+
+runtime = sgl.Runtime(model_path="meta-llama/Meta-Llama-3-8B", ...)
+
+safe, monitor = guard_sglang(
+    runtime,
+    on_shed_load=lambda u: load_balancer.set_weight("primary", 0),
+)
+print(safe.max_num_seqs)            # pass to --max-running-requests
+print(safe.gpu_memory_utilization)  # pass to --mem-fraction-static
+
+with monitor.session():
+    runtime.wait()
+```
+
+**Accepted types**: `sglang.Runtime` (unwrapped via `.engine`), bare
+`TokenizerManager` or engine object.
+
+**Architecture detection** — reads from `engine.server_args`:
+
+| Field | Source |
+|---|---|
+| `max_seq_len` | `server_args.context_length` → `server_args.max_total_tokens` → 8192 |
+| `dtype_bytes` | `server_args.dtype` (fp16/bf16 → 2, float32/fp32 → 4, int8 → 1) |
+| `model_bits` | `server_args.quantization` (awq/gptq/fp8/marlin → 4, bnb → 8, else 16) |
+| `max_num_seqs` | `server_args.max_running_requests` → 256 |
+
+When `engine.tp_worker.model_runner.model.config` is accessible, `num_kv_heads`,
+`num_layers`, and `hidden_size` are read from the HF config.  Otherwise
+conservative defaults apply (32 layers, 32 kv_heads, 4096 hidden).
+
+**Poll path** (tried in order):
+1. `engine.token_to_kv_pool.get_available_size()` / `.size` — preferred
+2. `engine.scheduler.get_stats().num_used_tokens` / `.num_total_tokens` — fallback
+3. Null fallback (0, 1) with a one-time warning if neither is available
+
+Parameters are identical to `guard_vllm` (except `min_num_seqs`).
+
+---
+
 ## Architectural Decision Records
 
-The two design decisions made during v0.2.0 development are documented in:
+The design decisions made during v0.2.0 and v0.3.0 are documented in:
 
 - [`docs/decisions/001-mid-training-downgrade-semantics.md`](decisions/001-mid-training-downgrade-semantics.md) — why downgrade is deferred to epoch boundary rather than applied immediately
 - [`docs/decisions/002-qlora-double-quant-bits.md`](decisions/002-qlora-double-quant-bits.md) — why `quantization_config` is trusted and a 5 % correction is applied rather than requiring explicit `model_bits`
+- [`docs/decisions/003-inference-signals-only.md`](decisions/003-inference-signals-only.md) — why `KVCacheMonitor` fires callbacks only and never mutates the serving engine

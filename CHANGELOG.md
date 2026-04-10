@@ -1,5 +1,68 @@
 # Changelog
 
+## [0.3.0] - 2026-04-10
+
+### Added — Inference Memory Monitoring
+
+- **`estimate_serving_memory()`** — KV cache ceiling estimator for inference
+  serving workloads.  Computes the worst-case memory required when all
+  `max_num_seqs` sequences are at full `max_seq_len` length:
+  `2 × num_layers × num_kv_heads × head_dim × max_seq_len × max_num_seqs × dtype_bytes`.
+  GQA-aware (`num_kv_heads` rather than `num_heads`).  Returns an
+  `InferenceServingEstimate` dataclass with per-component breakdown and a
+  `.fits_in(budget_mb)` helper.
+
+- **`MemoryGuard.preflight_inference()`** — binary search over `max_num_seqs`
+  to find the largest value that fits within the memory budget.  Returns an
+  `InferenceSafeConfig` with `max_num_seqs`, `max_seq_len`, and a
+  `gpu_memory_utilization` hint ready to pass to vLLM / SGLang CLI flags.
+
+- **`KVCacheMonitor`** — background-thread KV cache utilization monitor for
+  inference serving.  Polls a caller-supplied `poll_fn: () → (used, total)`,
+  fires `on_warning(u)` at ≥ 80 % and `on_shed_load(u)` at ≥ 92 %
+  utilization.  Shed-load takes priority over warning.  Both callbacks are
+  subject to a per-level cooldown (default 30 s).  The monitor never reads or
+  writes any attribute of the serving engine (ADR 003 — signals only, no
+  engine mutation).  Use via `monitor.session()` context manager or explicit
+  `start()` / `stop()`.
+
+- **vLLM adapter** (`pip install ml-memguard[vllm]`)
+  - `guard_vllm(llm, ...)` — accepts `vllm.LLM`, `vllm.AsyncLLMEngine`, or a
+    bare `vllm.LLMEngine`.  Reads `model_config.hf_config` for architecture
+    params, reads `scheduler_config.max_num_seqs` for concurrency limit, runs
+    `preflight_inference()`, and wires a `KVCacheMonitor` to
+    `scheduler.block_manager.get_num_free_gpu_blocks()`.
+  - Quantization detection: AWQ, GPTQ, GPTQ-Marlin, FP8 → 4 bits; BitsAndBytes
+    → 8 bits; unquantized → 16 bits.
+  - Returns `(InferenceSafeConfig, KVCacheMonitor)`.
+
+- **SGLang adapter** (`pip install ml-memguard[sglang]`)
+  - `guard_sglang(engine, ...)` — accepts `sglang.Runtime` (unwrapped via
+    `.engine`) or a bare `TokenizerManager`.  Reads `server_args.context_length`
+    and `server_args.max_running_requests`.  Wires `KVCacheMonitor` to
+    `engine.token_to_kv_pool` (preferred) or `engine.scheduler.get_stats()`
+    (fallback); logs a clear warning and falls back to null utilization when
+    neither is available.
+  - Returns `(InferenceSafeConfig, KVCacheMonitor)`.
+
+- **ADR 003** (`docs/decisions/003-inference-signals-only.md`) — documents the
+  signals-only design: why vLLM `max_num_seqs` cannot be hot-reconfigured,
+  why mutation is invasive, and how the callback design composes with nginx,
+  Envoy, PagerDuty, and Kubernetes autoscalers.
+
+- **New extras in `pyproject.toml`**:
+  `vllm = ["vllm>=0.4"]`, `sglang = ["sglang>=0.2"]`.
+  Both are included in `all`.
+
+### Tests
+
+- 83 new unit tests across `tests/test_inference_estimator.py`,
+  `tests/test_kv_cache_monitor.py`, `tests/test_vllm_adapter.py`, and
+  `tests/test_sglang_adapter.py`.  No vLLM or SGLang installation required —
+  all framework objects are simulated with `MagicMock`.
+
+---
+
 ## [0.2.0] - 2026-04-10
 
 ### Added — Framework Adapters

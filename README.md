@@ -1,6 +1,6 @@
 # memory-guard
 
-**Cross-platform memory guard for ML training. Prevents OOM crashes on Apple Silicon, CUDA, and CPU.**
+**Cross-platform memory guard for ML training and inference serving. Prevents OOM crashes on Apple Silicon, CUDA, and CPU.**
 
 No more frozen Macs. No more `CUDA out of memory`. Just training that works.
 
@@ -14,6 +14,8 @@ pip install ml-memguard[hf]             # + HuggingFace Transformers adapter
 pip install ml-memguard[unsloth]        # + Unsloth adapter
 pip install ml-memguard[apple]          # + MLX Metal ground-truth monitoring
 pip install ml-memguard[cuda]           # + CUDA OOM recovery
+pip install ml-memguard[vllm]           # + vLLM inference serving adapter
+pip install ml-memguard[sglang]         # + SGLang inference serving adapter
 ```
 
 ## The Problem
@@ -313,6 +315,48 @@ called.  Thread `safe.lora_rank`, `safe.lora_layers`, `safe.seq_length` into
 #### `guard_sft_trainer(trainer, guard=None, **preflight_overrides) -> SafeConfig`
 Identical to `guard_trainer` but named for TRL `SFTTrainer` workflows.
 
+### Inference Serving Adapters (v0.3, `pip install ml-memguard[vllm]` / `pip install ml-memguard[sglang]`)
+
+#### `guard_vllm(llm, ...) -> (InferenceSafeConfig, KVCacheMonitor)`
+Accepts a `vllm.LLM`, `vllm.AsyncLLMEngine`, or bare `vllm.LLMEngine`.  Reads
+architecture from `model_config.hf_config`, runs a binary search to find the
+largest `max_num_seqs` that fits in the GPU memory budget, and returns an
+unstarted `KVCacheMonitor` wired to the block manager.  See [`docs/adapters.md`](docs/adapters.md).
+
+```python
+from memory_guard import guard_vllm
+
+safe, monitor = guard_vllm(
+    llm,
+    on_shed_load=lambda u: load_balancer.reduce_weight("primary", 0),
+)
+# Start vLLM with safe params:
+#   vllm ... --max-num-seqs {safe.max_num_seqs} --gpu-memory-utilization {safe.gpu_memory_utilization}
+
+with monitor.session():
+    server.serve_forever()
+```
+
+#### `guard_sglang(engine, ...) -> (InferenceSafeConfig, KVCacheMonitor)`
+Accepts `sglang.Runtime` or a bare engine.  Reads `server_args.context_length`
+and `server_args.max_running_requests`.  Polls `token_to_kv_pool` (preferred)
+or `scheduler.get_stats()` (fallback).
+
+```python
+from memory_guard import guard_sglang
+
+safe, monitor = guard_sglang(
+    runtime,
+    on_shed_load=lambda u: nginx.upstream_weight("primary", 0),
+)
+with monitor.session():
+    runtime.wait()
+```
+
+**Design constraint** (ADR 003): both adapters emit signals only — they never
+mutate a running engine.  Load-shedding requires a load balancer or health
+endpoint in front of the engine.
+
 ## Estimation Accuracy
 
 Measured accuracy on real training runs. **We need your help expanding this table** — see [Contributing](#help-us-benchmark) below.
@@ -342,7 +386,7 @@ The estimation formula is based on published research (FlashAttention, HyC-LoRA,
 ## Known Limitations
 
 - **Single validation point**: Estimation accuracy is verified on one model/device combination. Your results may differ significantly — please report them.
-- **Inference workloads**: The runtime monitor is built for training loops. Inference serving (vLLM, SGLang) with dynamic KV cache growth is not yet monitored.
+- **Inference monitoring**: `KVCacheMonitor` (v0.3.0) emits signals only — it never mutates a running vLLM or SGLang engine. Load-shedding requires a load balancer or health-endpoint pattern in front of the engine.
 - **Calibration cold start**: Auto-calibration needs 3+ training runs on a given device before corrections kick in.
 - **Custom kernels**: Frameworks with heavily fused kernels (Unsloth) use less memory than the formula predicts. Calibration corrects this over time.
 - **MLX Metal thread safety**: `mx.metal.get_active_memory()` is called from a background thread. MLX's Metal backend has [known thread safety limitations](https://github.com/ml-explore/mlx/issues/2133). Memory counter reads work in practice but aren't guaranteed thread-safe by the MLX API.
@@ -380,8 +424,7 @@ Then open a [GitHub issue](https://github.com/vgpprasad91/ml-memguard/issues/new
 
 ### Other Contributions
 
-- **Inference monitoring**: KV cache growth tracking for serving workloads
-- **Framework adapters**: PyTorch Lightning, Axolotl, LitGPT wrappers (HF Transformers and Unsloth ship in v0.2.0)
+- **Framework adapters**: PyTorch Lightning, Axolotl, LitGPT wrappers (HF Transformers and Unsloth ship in v0.2.0; vLLM and SGLang in v0.3.0)
 - **Accuracy data**: Real training runs on CUDA or non-Apple hardware — see the table above
 - **Bug reports**: If the estimate was off by >30%, that's a bug — please report it with your config
 
