@@ -49,6 +49,7 @@ def __getattr__(name: str) -> object:
 
 
 from .estimator import (
+    InferenceServingEstimate,
     MemoryEstimate,
     ModelSpec,
     TrainSpec,
@@ -56,6 +57,7 @@ from .estimator import (
     ModelArch,
     estimate_training_memory,
     estimate_inference_memory,
+    estimate_serving_memory,
 )
 from .platforms import (
     detect_platform,
@@ -68,7 +70,7 @@ from .platforms import (
     Backend,
 )
 from .calibration import CalibrationStore, record_training_result
-from .guard import MemoryGuard, SafeConfig
+from .guard import MemoryGuard, SafeConfig, InferenceSafeConfig
 from .monitor import RuntimeMonitor
 from .cuda_recovery import CUDAOOMRecovery
 from .downgrade import auto_downgrade, DowngradeResult
@@ -76,6 +78,8 @@ from .downgrade import auto_downgrade, DowngradeResult
 __all__ = [
     "MemoryGuard",
     "SafeConfig",
+    "InferenceSafeConfig",
+    "InferenceServingEstimate",
     "MemoryEstimate",
     "ModelSpec",
     "TrainSpec",
@@ -83,6 +87,7 @@ __all__ = [
     "ModelArch",
     "estimate_training_memory",
     "estimate_inference_memory",
+    "estimate_serving_memory",
     "detect_platform",
     "get_available_memory_mb",
     "get_memory_pressure",

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .downgrade import DowngradeResult, auto_downgrade
-from .estimator import MemoryEstimate, estimate_training_memory
+from .estimator import InferenceServingEstimate, MemoryEstimate, estimate_serving_memory, estimate_training_memory
 from .monitor import RuntimeMonitor
 from .platforms import Backend, PlatformInfo, detect_platform, get_available_memory_mb
 
@@ -52,6 +52,40 @@ class SafeConfig:
             f"  estimated memory: {self.estimate.total_mb:.0f} MB",
             f"  budget:           {self.budget_mb:.0f} MB",
             f"  available:        {self.available_mb:.0f} MB",
+        ]
+        if self.changes:
+            lines.append(f"  changes applied:  {len(self.changes)}")
+            for c in self.changes:
+                lines.append(f"    - {c}")
+        return "\n".join(lines)
+
+
+@dataclass
+class InferenceSafeConfig:
+    """Memory-safe serving configuration returned by preflight_inference().
+
+    Pass max_num_seqs to vLLM's ``--max-num-seqs`` (or SGLang's equivalent)
+    and use gpu_memory_utilization as the ``--gpu-memory-utilization`` hint.
+    """
+    max_num_seqs: int
+    max_seq_len: int
+    gpu_memory_utilization: float    # Suggested vLLM / SGLang parameter (0–1)
+    estimate: InferenceServingEstimate
+    budget_mb: float
+    available_mb: float
+    fits: bool
+    changes: list[str]
+
+    def __str__(self) -> str:
+        status = "FITS" if self.fits else "DOES NOT FIT"
+        lines = [
+            f"InferenceSafeConfig ({status}):",
+            f"  max_num_seqs:            {self.max_num_seqs}",
+            f"  max_seq_len:             {self.max_seq_len}",
+            f"  gpu_memory_utilization:  {self.gpu_memory_utilization:.2f}",
+            f"  estimated memory:        {self.estimate.total_mb:.0f} MB",
+            f"  budget:                  {self.budget_mb:.0f} MB",
+            f"  available:               {self.available_mb:.0f} MB",
         ]
         if self.changes:
             lines.append(f"  changes applied:  {len(self.changes)}")
@@ -284,6 +318,109 @@ class MemoryGuard:
             **kwargs,
         )
         return mon.session(batch_size)
+
+    def preflight_inference(
+        self,
+        model_params: int,
+        model_bits: int = 16,
+        num_kv_heads: int = 8,
+        head_dim: int = 128,
+        num_layers: int = 32,
+        max_num_seqs: int = 256,
+        max_seq_len: int = 8192,
+        dtype_bytes: int = 2,
+        hidden_dim: int = 0,
+        min_num_seqs: int = 1,
+    ) -> InferenceSafeConfig:
+        """Run pre-flight memory check for a serving deployment.
+
+        Binary-searches for the largest ``max_num_seqs`` that fits within
+        the memory budget.  Never mutates a running engine — call this
+        before starting vLLM or SGLang to determine safe launch parameters.
+
+        The KV cache formula used is the ceiling:
+            2 × num_layers × num_kv_heads × head_dim × max_seq_len × max_num_seqs × dtype_bytes
+
+        Args:
+            model_params:   Total parameter count.
+            model_bits:     Weight quantization precision (4, 8, 16, 32).
+            num_kv_heads:   GQA-aware KV head count (e.g. 8 for Llama-3-8B).
+            head_dim:       Attention head dimension (hidden_dim // num_heads).
+            num_layers:     Number of transformer layers.
+            max_num_seqs:   Requested max concurrent requests.  Reduced if needed.
+            max_seq_len:    Maximum sequence length (prompt + generation).
+            dtype_bytes:    KV cache element width (2=fp16/bf16, 4=fp32, 1=int8).
+            hidden_dim:     When > 0, include decode-phase activation buffers.
+            min_num_seqs:   Never reduce max_num_seqs below this floor.
+
+        Returns:
+            InferenceSafeConfig with the largest fitting max_num_seqs, a
+            suggested gpu_memory_utilization, and fits=False when even
+            min_num_seqs exceeds the budget (engine may OOM under peak load).
+        """
+        available = self.available_mb
+        budget = self.budget_mb
+
+        _kw = dict(
+            model_params=model_params, model_bits=model_bits,
+            num_kv_heads=num_kv_heads, head_dim=head_dim,
+            num_layers=num_layers, max_seq_len=max_seq_len,
+            dtype_bytes=dtype_bytes, hidden_dim=hidden_dim,
+        )
+
+        # Fast path — requested config already fits
+        est = estimate_serving_memory(max_num_seqs=max_num_seqs, **_kw)
+        if est.fits_in(budget):
+            gpu_util = min(0.95, est.total_mb / available) if available > 0 else 0.90
+            return InferenceSafeConfig(
+                max_num_seqs=max_num_seqs, max_seq_len=max_seq_len,
+                gpu_memory_utilization=round(gpu_util, 4),
+                estimate=est, budget_mb=budget, available_mb=available,
+                fits=True, changes=[],
+            )
+
+        logger.warning(
+            "[memory-guard] %d seqs × %d tokens requires %.0f MB, "
+            "exceeds budget %.0f MB. Binary-searching for safe max_num_seqs...",
+            max_num_seqs, max_seq_len, est.total_mb, budget,
+        )
+
+        # Binary search: largest value in [min_num_seqs, max_num_seqs] that fits
+        lo, hi = min_num_seqs, max_num_seqs
+        safe_num_seqs: Optional[int] = None
+        safe_est: Optional[InferenceServingEstimate] = None
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = estimate_serving_memory(max_num_seqs=mid, **_kw)
+            if candidate.fits_in(budget):
+                safe_num_seqs = mid
+                safe_est = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        fits = safe_num_seqs is not None
+        if not fits:
+            # Even min_num_seqs doesn't fit — return it with fits=False
+            safe_num_seqs = min_num_seqs
+            safe_est = estimate_serving_memory(max_num_seqs=min_num_seqs, **_kw)
+
+        gpu_util = min(0.95, safe_est.total_mb / available) if available > 0 else 0.90
+        changes = [f"max_num_seqs reduced {max_num_seqs} → {safe_num_seqs}"]
+
+        logger.warning(
+            "[memory-guard] Safe max_num_seqs: %d (%.0f MB). "
+            "Suggested: vllm --max-num-seqs=%d --gpu-memory-utilization=%.4f",
+            safe_num_seqs, safe_est.total_mb, safe_num_seqs, gpu_util,
+        )
+
+        return InferenceSafeConfig(
+            max_num_seqs=safe_num_seqs, max_seq_len=max_seq_len,
+            gpu_memory_utilization=round(gpu_util, 4),
+            estimate=safe_est, budget_mb=budget, available_mb=available,
+            fits=fits, changes=changes,
+        )
 
     def record_result(
         self,

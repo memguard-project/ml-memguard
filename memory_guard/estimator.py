@@ -30,6 +30,46 @@ class ModelArch(Enum):
 
 
 @dataclass
+class InferenceServingEstimate:
+    """Memory breakdown for serving workloads (vLLM, SGLang, etc.).
+
+    Unlike MemoryEstimate (which is training-focused), this captures the
+    serving-specific profile: static model weights plus the KV cache ceiling
+    for max_num_seqs concurrent requests.
+    """
+    model_weights_mb: float = 0.0
+    kv_cache_mb: float = 0.0      # 2 × layers × kv_heads × head_dim × max_seq_len × max_num_seqs × dtype_bytes
+    activations_mb: float = 0.0   # Decode-phase per-token buffers; 0 when hidden_dim not supplied
+    overhead_mb: float = 0.0
+    total_mb: float = 0.0
+
+    # Serving parameters kept for reference
+    max_num_seqs: int = 0
+    max_seq_len: int = 0
+
+    def fits_in(self, budget_mb: float) -> bool:
+        """Return True if the total estimate fits within budget_mb."""
+        return self.total_mb <= budget_mb
+
+    def __str__(self) -> str:
+        lines = ["InferenceServingEstimate:"]
+        components: list[tuple[str, float]] = [
+            ("Model weights", self.model_weights_mb),
+            ("KV cache (ceiling)", self.kv_cache_mb),
+        ]
+        if self.activations_mb > 0:
+            components.append(("Activations (decode)", self.activations_mb))
+        components.append(("Framework overhead", self.overhead_mb))
+        for name, val in components:
+            lines.append(f"  {name + ':':<26}{val:>8.0f} MB")
+        lines.append(f"  {'-' * 36}")
+        lines.append(f"  {'TOTAL:':<26}{self.total_mb:>8.0f} MB ({self.total_mb / 1024:.1f} GB)")
+        lines.append(f"  max_num_seqs:  {self.max_num_seqs}")
+        lines.append(f"  max_seq_len:   {self.max_seq_len}")
+        return "\n".join(lines)
+
+
+@dataclass
 class MemoryEstimate:
     """Breakdown of estimated peak training memory."""
     model_weights_mb: float = 0.0
@@ -424,6 +464,98 @@ def estimate_inference_memory(
 
     subtotal = est.model_weights_mb + est.kv_cache_mb + est.activations_mb + est.encoder_mb
     from .constants import OVERHEAD_RATIO_INFERENCE, FIXED_OVERHEAD_MB
+    est.overhead_mb = subtotal * OVERHEAD_RATIO_INFERENCE + FIXED_OVERHEAD_MB
+    est.total_mb = subtotal + est.overhead_mb
+
+    return est
+
+
+def estimate_serving_memory(
+    model_params: int,
+    model_bits: int = 16,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    num_layers: int = 32,
+    max_num_seqs: int = 256,
+    max_seq_len: int = 8192,
+    dtype_bytes: int = 2,
+    hidden_dim: int = 0,
+) -> InferenceServingEstimate:
+    """Estimate peak memory for a vLLM / SGLang serving deployment.
+
+    Computes the KV cache CEILING (all sequences at max_seq_len simultaneously)
+    plus static model weight footprint.  PagedAttention / RadixAttention allocate
+    on demand so real-world utilization is typically lower, but
+    ``preflight_inference()`` uses this ceiling to guarantee the engine never
+    OOMs under peak load.
+
+    Args:
+        model_params:  Total parameter count of the model.
+        model_bits:    Weight quantization precision (4, 8, 16, 32).
+        num_kv_heads:  GQA-aware KV head count.  For MHA models this equals
+                       num_attention_heads.  For Llama-3-8B it is 8, not 32.
+        head_dim:      Attention head dimension (hidden_dim // num_attention_heads).
+        num_layers:    Number of transformer layers.
+        max_num_seqs:  Maximum concurrent requests (vLLM ``--max-num-seqs``).
+        max_seq_len:   Maximum total sequence length per request (prompt +
+                       generation); corresponds to vLLM ``--max-model-len``.
+        dtype_bytes:   KV cache element width in bytes.
+                       2 = fp16 / bf16 (default), 4 = fp32, 1 = int8 / fp8.
+        hidden_dim:    Model hidden dimension.  When > 0, per-token decode-phase
+                       activation buffers are included.  When 0 (default) they
+                       are omitted — they are typically < 1 % of the KV cache
+                       for large max_num_seqs and are absorbed by the overhead
+                       factor.
+
+    Returns:
+        InferenceServingEstimate with model_weights_mb, kv_cache_mb,
+        activations_mb, overhead_mb, and total_mb.
+    """
+    if model_params < 0:
+        raise ValueError(f"model_params must be >= 0, got {model_params}")
+    if model_bits not in (2, 3, 4, 8, 16, 32):
+        raise ValueError(f"model_bits must be 2/3/4/8/16/32, got {model_bits}")
+    if num_kv_heads < 1:
+        raise ValueError(f"num_kv_heads must be >= 1, got {num_kv_heads}")
+    if head_dim < 1:
+        raise ValueError(f"head_dim must be >= 1, got {head_dim}")
+    if num_layers < 1:
+        raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+    if max_num_seqs < 1:
+        raise ValueError(f"max_num_seqs must be >= 1, got {max_num_seqs}")
+    if max_seq_len < 1:
+        raise ValueError(f"max_seq_len must be >= 1, got {max_seq_len}")
+    if dtype_bytes not in (1, 2, 4):
+        raise ValueError(f"dtype_bytes must be 1, 2, or 4, got {dtype_bytes}")
+
+    MB = 1024 * 1024
+    est = InferenceServingEstimate(max_num_seqs=max_num_seqs, max_seq_len=max_seq_len)
+
+    # 1. Static model weights — loaded once at engine start, never change
+    est.model_weights_mb = (model_params * (model_bits / 8)) / MB
+
+    # 2. KV cache ceiling
+    #    Two tensors (K and V) per layer, for every KV head, for every
+    #    token position in every concurrent sequence.
+    #    Formula: 2 × num_layers × num_kv_heads × head_dim
+    #             × max_seq_len × max_num_seqs × dtype_bytes
+    kv_bytes = (
+        2 * num_layers * num_kv_heads * head_dim
+        * max_seq_len * max_num_seqs * dtype_bytes
+    )
+    est.kv_cache_mb = kv_bytes / MB
+
+    # 3. Per-request activation buffers (decode phase only)
+    #    Each active request processes one new token per forward pass, so
+    #    activation per pass ≈ max_num_seqs × hidden_dim × num_layers × dtype_bytes.
+    #    Typically < 1 % of the KV cache for large deployments.
+    if hidden_dim > 0:
+        act_bytes = max_num_seqs * hidden_dim * num_layers * dtype_bytes
+        est.activations_mb = act_bytes / MB
+
+    # 4. Proportional fragmentation overhead + fixed framework runtime cost
+    from .constants import OVERHEAD_RATIO_INFERENCE, FIXED_OVERHEAD_MB
+    subtotal = est.model_weights_mb + est.kv_cache_mb + est.activations_mb
     est.overhead_mb = subtotal * OVERHEAD_RATIO_INFERENCE + FIXED_OVERHEAD_MB
     est.total_mb = subtotal + est.overhead_mb
 
