@@ -71,6 +71,7 @@ from .platforms import (
 )
 from .calibration import CalibrationStore, record_training_result
 from .guard import MemoryGuard, SafeConfig, InferenceSafeConfig
+from .inference_monitor import KVCacheMonitor
 from .monitor import RuntimeMonitor
 from .cuda_recovery import CUDAOOMRecovery
 from .downgrade import auto_downgrade, DowngradeResult
@@ -97,6 +98,7 @@ __all__ = [
     "PlatformInfo",
     "Backend",
     "RuntimeMonitor",
+    "KVCacheMonitor",
     "CUDAOOMRecovery",
     "CalibrationStore",
     "record_training_result",

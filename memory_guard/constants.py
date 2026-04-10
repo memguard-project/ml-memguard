@@ -174,6 +174,24 @@ CALIBRATION_MAX_POINTS = 50
 """Maximum stored calibration points (FIFO, oldest dropped).
 Engineering default."""
 
+# Inference KV Cache Monitor
+
+KV_CACHE_WARNING_THRESHOLD = 0.80
+"""KV cache utilization (used_blocks / total_blocks) that fires on_warning.
+
+80 % matches the training monitor WARNING threshold.  Engineering default —
+not measured.  Operators on systems with heavy prefill bursts may lower this.
+"""
+
+KV_CACHE_SHED_LOAD_THRESHOLD = 0.92
+"""KV cache utilization that fires on_shed_load.
+
+At 92 % the engine approaches KV block exhaustion.  vLLM begins preempting
+(recomputing) requests; SGLang rejects new ones.  The shed-load callback
+signals the caller's load balancer to reduce concurrency before the engine
+starts self-protecting.  Engineering default — not measured.
+"""
+
 # Fallback
 
 FALLBACK_MEMORY_MB = 8192
