@@ -178,28 +178,44 @@ trainer.train()
 
 ### With Unsloth
 
+Three lines — no manual architecture spelunking required.  `guard_unsloth_model`
+introspects the loaded model, runs preflight, and returns a `SafeConfig` you
+thread directly into `get_peft_model`.
+
 ```python
-from memory_guard import MemoryGuard
+from memory_guard import guard_unsloth_model, guard_sft_trainer
 from unsloth import FastLanguageModel
+from trl import SFTTrainer
 
-guard = MemoryGuard.auto()
-safe = guard.preflight(
-    model_params=8e9, model_bits=4,
-    hidden_dim=4096, num_heads=32, num_layers=32,
-    batch_size=4, seq_length=2048,
-    lora_rank=16, lora_layers=16,
-)
-
+# 1. Load model (before LoRA)
 model, tokenizer = FastLanguageModel.from_pretrained(
     "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
-    max_seq_length=safe.seq_length,
+    max_seq_length=2048,
     load_in_4bit=True,
 )
+
+# 2. Preflight — reads architecture automatically, auto-downgrades if needed
+safe = guard_unsloth_model(model)   # ← the one line that replaces all the math
+
+# 3. Attach LoRA using the safe values
 model = FastLanguageModel.get_peft_model(
-    model, r=safe.lora_rank, lora_alpha=safe.lora_rank * 2,
+    model,
+    r=safe.lora_rank,
+    lora_alpha=safe.lora_rank * 2,
+    max_seq_length=safe.seq_length,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
 )
+
+# 4. Train with mid-training downgrade protection
+trainer = SFTTrainer(model=model, tokenizer=tokenizer, ...)
+guard_sft_trainer(trainer)   # patches trainer.args + adds MemoryGuardCallback
+trainer.train()
 ```
+
+> **BnB double-quantization**: Unsloth loads with `bnb_4bit_use_double_quant=True`
+> by default.  memory-guard detects this and applies a 5 % correction to the
+> weight-memory estimate.  Auto-calibration refines the correction after 3+
+> training runs.
 
 ## API Reference
 

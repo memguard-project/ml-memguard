@@ -32,6 +32,8 @@ __version__ = "0.1.0"
 _LAZY_ADAPTER_ATTRS = {
     "MemoryGuardCallback": "memory_guard.adapters.huggingface",
     "guard_trainer": "memory_guard.adapters.huggingface",
+    "guard_unsloth_model": "memory_guard.adapters.unsloth",
+    "guard_sft_trainer": "memory_guard.adapters.unsloth",
 }
 
 
@@ -98,4 +100,7 @@ __all__ = [
     # HuggingFace adapter (lazy — resolved only on access)
     "MemoryGuardCallback",
     "guard_trainer",
+    # Unsloth adapter (lazy — resolved only on access)
+    "guard_unsloth_model",
+    "guard_sft_trainer",
 ]
