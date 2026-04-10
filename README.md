@@ -151,30 +151,28 @@ with guard.monitor(safe.batch_size) as mon:
     )
 ```
 
-### With HuggingFace Transformers (CUDA)
+### With HuggingFace Transformers (CUDA / CPU)
+
+One call reads the model's architecture, runs preflight, patches `trainer.args`,
+and attaches `MemoryGuardCallback` for mid-training batch-size downgrade.
 
 ```python
-from memory_guard import MemoryGuard
-from transformers import Trainer, TrainingArguments
+from memory_guard import guard_trainer
+from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
 
-guard = MemoryGuard.auto()
-safe = guard.preflight(
-    model_params=7e9, model_bits=16,
-    hidden_dim=4096, num_heads=32, num_layers=32,
-    batch_size=8, seq_length=2048,
-    lora_rank=16, lora_layers=16,
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B")
+trainer = Trainer(
+    model=model,
+    args=TrainingArguments(output_dir="./output", max_steps=1000),
+    train_dataset=train_set,
 )
 
-args = TrainingArguments(
-    output_dir="./output",
-    per_device_train_batch_size=safe.batch_size,
-    gradient_accumulation_steps=safe.grad_accumulation,
-    gradient_checkpointing=safe.grad_checkpoint,
-    max_steps=1000,
-)
-trainer = Trainer(model=model, args=args, train_dataset=train_set)
+guard_trainer(trainer)   # reads model, runs preflight, patches args + callback
 trainer.train()
 ```
+
+Pass `preflight_overrides` to lock in specific values the adapter can't infer
+(e.g. `guard_trainer(trainer, batch_size=8, seq_length=4096, lora_rank=32)`).
 
 ### With Unsloth
 
@@ -217,6 +215,50 @@ trainer.train()
 > weight-memory estimate.  Auto-calibration refines the correction after 3+
 > training runs.
 
+## Framework Adapters
+
+New in v0.2 — adapters read the model's architecture automatically so you don't
+have to look up `hidden_size`, `num_heads`, or `num_layers`.
+
+### How model introspection works
+
+`introspect_model(model)` reads directly from `model.config` and
+`model.parameters()` without importing torch or transformers at the call site:
+
+| Field read | Source |
+|---|---|
+| `hidden_size` | `model.config.hidden_size` |
+| `num_attention_heads` | `model.config.num_attention_heads` |
+| `num_hidden_layers` | `model.config.num_hidden_layers` |
+| `num_key_value_heads` | `model.config.num_key_value_heads` (falls back to `num_attention_heads` for MHA) |
+| `model_bits` | `quantization_config.load_in_4bit / load_in_8bit`, else `model.dtype` (fp16/bf16 → 16, fp32 → 32) |
+| `num_parameters` | `sum(p.numel() for p in model.parameters())` |
+
+### When to pass `preflight_overrides`
+
+Introspected values cover most cases.  Override when:
+
+| Scenario | Pass |
+|---|---|
+| Specific training batch size | `batch_size=8` |
+| Non-default sequence length | `seq_length=4096` |
+| Fixed LoRA config | `lora_rank=32, lora_layers=24` |
+| Model loaded at different precision | `model_bits=16` |
+
+```python
+# Override batch_size and lora_rank; everything else is introspected
+guard_trainer(trainer, batch_size=8, lora_rank=32)
+safe = guard_unsloth_model(model, seq_length=4096, lora_rank=16)
+```
+
+### QLoRA with BnB double-quantization
+
+When Unsloth (or any HF model) loads with `bnb_4bit_use_double_quant=True`,
+`guard_unsloth_model` automatically applies a 5 % correction to the weight-memory
+estimate.  `model_bits` stays 4; only `num_parameters` is scaled down to proxy
+the reduced quantization-constant footprint.  After 3+ runs, auto-calibration
+refines the correction further.
+
 ## API Reference
 
 ### `MemoryGuard.auto(safety_ratio=0.80)`
@@ -239,6 +281,28 @@ Standalone downgrade function.
 
 ### `CUDAOOMRecovery(initial_batch_size)`
 CUDA-specific OOM catch-and-retry wrapper.
+
+### Framework Adapters (v0.2, `pip install ml-memguard[hf]`)
+
+#### `guard_trainer(trainer, guard=None, **preflight_overrides) -> SafeConfig`
+Attach memory-guard to a HuggingFace `Trainer` in one call.  Introspects the
+model, runs preflight, writes safe values to `trainer.args`, and appends
+`MemoryGuardCallback`.
+
+#### `MemoryGuardCallback(guard)`
+`TrainerCallback` subclass.  `on_train_begin` starts the monitor;
+`on_step_begin` records a pending batch-size downgrade when the monitor signals
+pressure; `on_epoch_begin` applies it (scales `gradient_accumulation_steps` to
+preserve effective batch); `on_train_end` stops the monitor and records
+calibration data.
+
+#### `guard_unsloth_model(model, guard=None, **preflight_overrides) -> SafeConfig`
+Run preflight on an Unsloth model before `FastLanguageModel.get_peft_model` is
+called.  Thread `safe.lora_rank`, `safe.lora_layers`, `safe.seq_length` into
+`get_peft_model`.  Detects BnB double-quantization and applies a 5 % correction.
+
+#### `guard_sft_trainer(trainer, guard=None, **preflight_overrides) -> SafeConfig`
+Identical to `guard_trainer` but named for TRL `SFTTrainer` workflows.
 
 ## Estimation Accuracy
 
@@ -305,8 +369,8 @@ Then open a [GitHub issue](https://github.com/vgpprasad91/ml-memguard/issues/new
 
 ### Other Contributions
 
-- **Framework adapters**: Thin wrappers for HuggingFace Trainer, Unsloth, PyTorch Lightning
 - **Inference monitoring**: KV cache growth tracking for serving workloads
+- **Framework adapters**: PyTorch Lightning, Axolotl, LitGPT wrappers
 - **Bug reports**: If the estimate was off by >30%, that's a bug — please report it with your config
 
 ## License
