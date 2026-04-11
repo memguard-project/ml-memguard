@@ -234,9 +234,13 @@ trainer.train()
 ## Inference Serving Adapters (v0.3.0)
 
 These adapters integrate with serving frameworks.  They never mutate a running
-engine — all load-shedding is delegated to the caller via callbacks (ADR 003).
+engine — all load-shedding is delegated to the caller via callbacks on the
+`KVCacheMonitor` (ADR 003).
 
-### `guard_vllm(llm, ...) -> (InferenceSafeConfig, KVCacheMonitor)`
+See **[`docs/inference.md`](inference.md)** for the full inference reference guide,
+including the `KVCacheMonitor` hook table and end-to-end workflow examples.
+
+### `guard_vllm(llm, guard=None, **preflight_overrides) -> InferenceSafeConfig`
 
 **Install**: `pip install ml-memguard[vllm]`  
 **Module**: `memory_guard.adapters.vllm`
@@ -247,14 +251,14 @@ from memory_guard import guard_vllm
 
 llm = LLM(model="meta-llama/Meta-Llama-3-8B", ...)
 
-safe, monitor = guard_vllm(
-    llm,
-    on_shed_load=lambda u: load_balancer.reduce_weight("primary", 0),
-)
+safe = guard_vllm(llm)
 print(safe.max_num_seqs)            # pass to vLLM --max-num-seqs
 print(safe.gpu_memory_utilization)  # pass to vLLM --gpu-memory-utilization
 
-with monitor.session():
+# Wire load-shedding callbacks before starting
+safe.monitor.on_shed_load = lambda u: load_balancer.reduce_weight("primary", 0)
+
+with safe.monitor.session():
     server.serve_forever()
 ```
 
@@ -270,30 +274,32 @@ with monitor.session():
 | `num_layers` | `hf_config.num_hidden_layers` |
 | `max_seq_len` | `model_config.max_model_len` |
 | `dtype_bytes` | `model_config.dtype` (fp16/bf16 → 2, fp32 → 4, int8 → 1) |
-| `model_bits` | `model_config.quantization` (awq/gptq/fp8 → 4, bnb/smooth → 8, else 16) |
+| `model_bits` | `model_config.quantization` (awq/gptq/fp8/awq_marlin/gptq_marlin → 4, bnb/smooth → 8, else 16) |
 | `model_params` | `hf_config.num_parameters` → else 12 × H² × L estimate |
+
+**KV cache back-calculation**: when `cache_config.num_gpu_blocks > 0`, the adapter
+derives `max_num_seqs` from the actual vLLM pre-allocation:
+`blocks_per_seq = ceil(max_seq_len / block_size)`;
+`actual_max_seqs = num_gpu_blocks // blocks_per_seq`.
+This keeps the preflight estimate and live utilization on the same scale.
+`gpu_memory_utilization` is then refined from the measured KV MB vs `available_mb`.
 
 **Poll path**: `engine.scheduler.block_manager.get_num_free_gpu_blocks()` and
 `.get_num_total_gpu_blocks()`.  Falls back to null utilization (returns `(0, 1)`)
 if the block manager is not accessible, with a one-time warning.
 
-**Parameters**:
+**`preflight_overrides`** — any keyword accepted by `preflight_inference()` overrides
+the introspected value.  Common overrides:
 
-| Parameter | Default | Description |
-|---|---|---|
-| `available_mb` | auto (CUDA) | Override GPU memory for preflight |
-| `max_num_seqs` | from `scheduler_config` | Max concurrent requests |
-| `max_seq_len` | from `model_config` | Max sequence length |
-| `on_warning` | None | Callback at ≥ 80 % KV cache utilization |
-| `on_shed_load` | None | Callback at ≥ 92 % KV cache utilization |
-| `poll_interval` | 5.0 s | Background poll frequency |
-| `cooldown_seconds` | 30.0 s | Min gap between repeated callback firings |
-| `safety_ratio` | 0.80 | Fraction of available memory used as budget |
-| `min_num_seqs` | 1 | Binary-search floor |
+| Override | When to use |
+|---|---|
+| `max_num_seqs=32` | Cap concurrency below the back-calculated value |
+| `max_seq_len=4096` | Force a specific sequence length |
+| `model_bits=16` | Model loaded at different precision than config reports |
 
 ---
 
-### `guard_sglang(engine, ...) -> (InferenceSafeConfig, KVCacheMonitor)`
+### `guard_sglang(engine, guard=None, **preflight_overrides) -> InferenceSafeConfig`
 
 **Install**: `pip install ml-memguard[sglang]`  
 **Module**: `memory_guard.adapters.sglang`
@@ -304,19 +310,18 @@ from memory_guard import guard_sglang
 
 runtime = sgl.Runtime(model_path="meta-llama/Meta-Llama-3-8B", ...)
 
-safe, monitor = guard_sglang(
-    runtime,
-    on_shed_load=lambda u: load_balancer.set_weight("primary", 0),
-)
+safe = guard_sglang(runtime)
 print(safe.max_num_seqs)            # pass to --max-running-requests
 print(safe.gpu_memory_utilization)  # pass to --mem-fraction-static
 
-with monitor.session():
+safe.monitor.on_shed_load = lambda u: load_balancer.set_weight("primary", 0)
+
+with safe.monitor.session():
     runtime.wait()
 ```
 
 **Accepted types**: `sglang.Runtime` (unwrapped via `.engine`), bare
-`TokenizerManager` or engine object.
+`TokenizerManager` or any engine object with `server_args`.
 
 **Architecture detection** — reads from `engine.server_args`:
 
@@ -325,18 +330,25 @@ with monitor.session():
 | `max_seq_len` | `server_args.context_length` → `server_args.max_total_tokens` → 8192 |
 | `dtype_bytes` | `server_args.dtype` (fp16/bf16 → 2, float32/fp32 → 4, int8 → 1) |
 | `model_bits` | `server_args.quantization` (awq/gptq/fp8/marlin → 4, bnb → 8, else 16) |
-| `max_num_seqs` | `server_args.max_running_requests` → 256 |
 
 When `engine.tp_worker.model_runner.model.config` is accessible, `num_kv_heads`,
-`num_layers`, and `hidden_size` are read from the HF config.  Otherwise
+`num_layers`, and `hidden_size` are read from the HF config directly.  Otherwise
 conservative defaults apply (32 layers, 32 kv_heads, 4096 hidden).
 
-**Poll path** (tried in order):
-1. `engine.token_to_kv_pool.get_available_size()` / `.size` — preferred
-2. `engine.scheduler.get_stats().num_used_tokens` / `.num_total_tokens` — fallback
-3. Null fallback (0, 1) with a one-time warning if neither is available
+**Token pool back-calculation**: `actual_max_seqs = total_token_slots // max_seq_len`
+from the actual pool size — same principle as the vLLM block back-calculation.
 
-Parameters are identical to `guard_vllm` (except `min_num_seqs`).
+**Poll path** (tried in order):
+1. `engine.token_to_kv_pool.get_available_size()` / `.size` — preferred (SGLang ≥ 0.3.0)
+2. `engine.mem_pool.available` / `.size` — older SGLang
+3. `engine.scheduler.get_stats().num_used_tokens` / `.num_total_tokens` — fallback
+4. Null fallback `(0, 1)` with a one-time warning if nothing is accessible
+
+**Rolling-max smoothing**: SGLang's RadixAttention prefix-cache can evict large KV
+blocks at once, causing utilization to drop suddenly.  The adapter wraps the raw
+poll with a 3-reading rolling maximum so that a single eviction event does not
+prematurely clear a shed-load signal.  The signal clears naturally once all 3
+consecutive readings fall below the threshold.
 
 ---
 

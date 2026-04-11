@@ -14,8 +14,12 @@
 
 - **`MemoryGuard.preflight_inference()`** — binary search over `max_num_seqs`
   to find the largest value that fits within the memory budget.  Returns an
-  `InferenceSafeConfig` with `max_num_seqs`, `max_seq_len`, and a
-  `gpu_memory_utilization` hint ready to pass to vLLM / SGLang CLI flags.
+  `InferenceSafeConfig` with `max_num_seqs`, `max_seq_len`, `gpu_memory_utilization`,
+  and a `monitor` field (see below) ready to pass to vLLM / SGLang CLI flags.
+
+- **`InferenceSafeConfig.monitor`** — `KVCacheMonitor` attached by the adapter
+  functions below.  Unstarted on return; use `safe.monitor.start()` or
+  `with safe.monitor.session(): ...` when ready to serve.
 
 - **`KVCacheMonitor`** — background-thread KV cache utilization monitor for
   inference serving.  Polls a caller-supplied `poll_fn: () → (used, total)`,
@@ -27,39 +31,61 @@
   `start()` / `stop()`.
 
 - **vLLM adapter** (`pip install ml-memguard[vllm]`)
-  - `guard_vllm(llm, ...)` — accepts `vllm.LLM`, `vllm.AsyncLLMEngine`, or a
-    bare `vllm.LLMEngine`.  Reads `model_config.hf_config` for architecture
-    params, reads `scheduler_config.max_num_seqs` for concurrency limit, runs
-    `preflight_inference()`, and wires a `KVCacheMonitor` to
-    `scheduler.block_manager.get_num_free_gpu_blocks()`.
-  - Quantization detection: AWQ, GPTQ, GPTQ-Marlin, FP8 → 4 bits; BitsAndBytes
-    → 8 bits; unquantized → 16 bits.
-  - Returns `(InferenceSafeConfig, KVCacheMonitor)`.
+  - `guard_vllm(llm, guard=None, **preflight_overrides) -> InferenceSafeConfig`
+    accepts `vllm.LLM`, `vllm.AsyncLLMEngine`, or a bare `vllm.LLMEngine`.
+    Reads `model_config.hf_config` for architecture params.
+  - Back-calculates `max_num_seqs` from `cache_config.num_gpu_blocks`:
+    `blocks_per_seq = ceil(max_seq_len / block_size)`;
+    `actual_max_seqs = num_gpu_blocks // blocks_per_seq`.
+    Keeps the preflight estimate and live utilization on the same scale.
+  - Refines `gpu_memory_utilization` from the actual measured KV MB vs
+    available memory.
+  - Wires `KVCacheMonitor` poll_fn to
+    `scheduler.block_manager.get_num_free_gpu_blocks()` and
+    `.get_num_total_gpu_blocks()`.
+  - Quantization detection: AWQ / GPTQ / AWQ-Marlin / GPTQ-Marlin / FP8 /
+    SqueezeLLM → 4 bits; BitsAndBytes / SmoothQuant → 8 bits; else 16 bits.
+  - Returns `InferenceSafeConfig` with `safe.monitor` set (unstarted).
 
 - **SGLang adapter** (`pip install ml-memguard[sglang]`)
-  - `guard_sglang(engine, ...)` — accepts `sglang.Runtime` (unwrapped via
-    `.engine`) or a bare `TokenizerManager`.  Reads `server_args.context_length`
-    and `server_args.max_running_requests`.  Wires `KVCacheMonitor` to
-    `engine.token_to_kv_pool` (preferred) or `engine.scheduler.get_stats()`
-    (fallback); logs a clear warning and falls back to null utilization when
-    neither is available.
-  - Returns `(InferenceSafeConfig, KVCacheMonitor)`.
+  - `guard_sglang(engine, guard=None, **preflight_overrides) -> InferenceSafeConfig`
+    accepts `sglang.Runtime` (unwrapped via `.engine`) or any bare engine
+    object with `server_args`.
+  - Reads `server_args.{context_length, dtype, quantization}` and walks
+    `tp_worker.model_runner.model.config` for HF architecture fields.
+  - Back-calculates `max_num_seqs` from the actual token pool:
+    `actual_max_seqs = total_token_slots // max_seq_len`.
+  - Polls `engine.token_to_kv_pool.get_available_size()` (SGLang ≥ 0.3.0,
+    preferred) or `engine.mem_pool.available` (older SGLang), with a
+    `scheduler.get_stats()` fallback and a null fallback with a one-time
+    warning.
+  - **3-reading rolling-max smoothing**: SGLang's RadixAttention prefix-cache
+    can evict large KV blocks suddenly, causing utilization to drop below the
+    shed-load threshold.  The `poll_fn` tracks the last 3 raw utilization
+    values and reports their maximum, suppressing transient drops without
+    delaying recovery detection once pressure genuinely recedes.
+  - Returns `InferenceSafeConfig` with `safe.monitor` set (unstarted).
 
 - **ADR 003** (`docs/decisions/003-inference-signals-only.md`) — documents the
   signals-only design: why vLLM `max_num_seqs` cannot be hot-reconfigured,
   why mutation is invasive, and how the callback design composes with nginx,
   Envoy, PagerDuty, and Kubernetes autoscalers.
 
+- **`docs/inference.md`** — new reference guide covering `estimate_serving_memory`,
+  `preflight_inference`, `InferenceSafeConfig`, the `KVCacheMonitor` hook table
+  (poll_fn contract, thresholds, callbacks, cooldown), and full vLLM / SGLang
+  workflow examples.
+
 - **New extras in `pyproject.toml`**:
-  `vllm = ["vllm>=0.4"]`, `sglang = ["sglang>=0.2"]`.
+  `vllm = ["vllm>=0.4"]`, `sglang = ["sglang>=0.3"]`.
   Both are included in `all`.
 
 ### Tests
 
-- 83 new unit tests across `tests/test_inference_estimator.py`,
+- 122 new unit tests across `tests/test_inference_estimator.py`,
   `tests/test_kv_cache_monitor.py`, `tests/test_vllm_adapter.py`, and
   `tests/test_sglang_adapter.py`.  No vLLM or SGLang installation required —
-  all framework objects are simulated with `MagicMock`.
+  all framework objects are simulated with `MagicMock`.  Total suite: 325 tests.
 
 ---
 
