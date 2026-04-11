@@ -1,54 +1,60 @@
 """vLLM adapter for memory-guard.
 
 Provides:
-    guard_vllm — introspect a running vLLM engine, run preflight_inference()
-                 to find a safe max_num_seqs, and wire a KVCacheMonitor to
-                 the engine's block manager.
+    guard_vllm(llm, guard=None, **preflight_overrides) -> InferenceSafeConfig
+
+    One-call setup: introspects the running engine, calls
+    ``guard.preflight_inference()``, wires a ``KVCacheMonitor`` to the block
+    manager, and returns an ``InferenceSafeConfig`` with ``safe.monitor`` set.
 
 Design contract (ADR 003)
 --------------------------
-``guard_vllm`` constructs and returns a ``KVCacheMonitor``.  It never calls
-into the engine except through the returned monitor's ``poll_fn``.  The
-``poll_fn`` reads ``used_blocks`` and ``total_blocks`` from the block manager
-but never writes to it.  All load-shedding decisions are delegated to the
-caller via ``on_warning`` and ``on_shed_load`` callbacks.
+``guard_vllm`` never mutates the running engine.  The ``KVCacheMonitor``
+at ``safe.monitor`` only reads ``block_manager.get_num_free_gpu_blocks()``
+and ``get_num_total_gpu_blocks()`` from a daemon thread.  All load-shedding
+decisions are delegated to the caller via ``on_warning`` / ``on_shed_load``
+callbacks on the monitor.
 
-Supported vLLM object types
-----------------------------
-- ``vllm.LLM``             — offline batch inference wrapper; exposes
-                             the engine as ``llm.llm_engine``.
-- ``vllm.AsyncLLMEngine``  — async serving engine; exposes it as
-                             ``llm.engine``.
-- ``vllm.LLMEngine``       — the raw engine (passed through directly).
+KV cache back-calculation
+--------------------------
+When ``engine.cache_config.num_gpu_blocks`` is available, the adapter
+derives the actual maximum concurrent sequences that vLLM can serve at
+``max_seq_len`` tokens each:
+
+    blocks_per_seq  = ceil(max_seq_len / block_size)   # block_size default 16
+    actual_max_seqs = num_gpu_blocks // blocks_per_seq
+
+This ensures the ``max_num_seqs`` passed to ``preflight_inference()`` is
+calibrated to vLLM's real pre-allocation rather than an external guess.
+The ``gpu_memory_utilization`` field is then refined using the actual KV MB:
+
+    actual_kv_mb = num_gpu_blocks × block_size × 2 × num_layers
+                   × num_kv_heads × head_dim × dtype_bytes  (in bytes / MB)
 
 Usage::
 
     from vllm import LLM
-    from memory_guard.adapters.vllm import guard_vllm
+    from memory_guard import guard_vllm
 
-    llm = LLM(model="meta-llama/Meta-Llama-3-8B", ...)
+    llm = LLM(model="meta-llama/Meta-Llama-3-8B-Instruct", ...)
 
-    safe, monitor = guard_vllm(
-        llm,
-        on_shed_load=lambda u: load_balancer.reduce_weight("primary", 0),
-    )
-
+    safe = guard_vllm(llm)
     print(safe)                         # InferenceSafeConfig
-    print(safe.max_num_seqs)            # Pass to vLLM --max-num-seqs
-    print(safe.gpu_memory_utilization)  # Pass to vLLM --gpu-memory-utilization
+    print(safe.max_num_seqs)            # safe --max-num-seqs
+    print(safe.gpu_memory_utilization)  # safe --gpu-memory-utilization
 
-    with monitor.session():
+    with safe.monitor.session():
         server.serve_forever()
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+import math
+from typing import Optional
 
-from ..constants import MONITOR_POLL_INTERVAL, OVERHEAD_RATIO_INFERENCE, FIXED_OVERHEAD_MB, SAFETY_RATIO_DEFAULT
-from ..estimator import InferenceServingEstimate, estimate_serving_memory
-from ..guard import InferenceSafeConfig
+from ..constants import MONITOR_POLL_INTERVAL
+from ..guard import InferenceSafeConfig, MemoryGuard
 from ..inference_monitor import KVCacheMonitor
 from .base import optional_import
 
@@ -62,48 +68,35 @@ logger = logging.getLogger(__name__)
 
 def guard_vllm(
     llm: object,
-    available_mb: Optional[float] = None,
-    max_num_seqs: Optional[int] = None,
-    max_seq_len: Optional[int] = None,
-    on_warning: Optional[Callable[[float], None]] = None,
-    on_shed_load: Optional[Callable[[float], None]] = None,
-    poll_interval: float = MONITOR_POLL_INTERVAL,
-    cooldown_seconds: float = 30.0,
-    safety_ratio: float = SAFETY_RATIO_DEFAULT,
-    min_num_seqs: int = 1,
-) -> tuple[InferenceSafeConfig, KVCacheMonitor]:
+    guard: Optional[MemoryGuard] = None,
+    **preflight_overrides,
+) -> InferenceSafeConfig:
     """Preflight check and KV cache monitor for a vLLM engine.
 
-    Reads the model architecture from the engine's ``model_config``, runs a
-    binary search to find the largest ``max_num_seqs`` that fits in the GPU
-    memory budget, and returns a wired-but-unstarted ``KVCacheMonitor``.
+    Introspects ``llm.llm_engine.model_config`` for architecture fields,
+    calls ``guard.preflight_inference()``, then constructs a
+    ``KVCacheMonitor`` whose ``poll_fn`` reads
+    ``llm.llm_engine.scheduler.block_manager.get_num_free_gpu_blocks()``
+    and total blocks.  The monitor is unstarted — use ``safe.monitor.start()``
+    or ``with safe.monitor.session(): ...`` when ready to serve.
 
-    The monitor polls ``block_manager.get_num_free_gpu_blocks()`` from a
-    daemon thread and fires ``on_warning`` / ``on_shed_load`` callbacks —
-    it never mutates the engine (ADR 003).
+    ``cache_config.num_gpu_blocks`` is read to back-calculate the actual KV
+    cache capacity vLLM pre-allocated, so the preflight estimate and the live
+    utilization signal are on the same scale.
 
     Args:
-        llm:               A ``vllm.LLM``, ``vllm.AsyncLLMEngine``, or
-                           ``vllm.LLMEngine`` instance.
-        available_mb:      Available GPU memory in MB.  Auto-detected from
-                           CUDA if not provided.
-        max_num_seqs:      Max concurrent requests for the preflight check.
-                           Defaults to ``engine.scheduler_config.max_num_seqs``.
-        max_seq_len:       Max sequence length.  Defaults to
-                           ``engine.model_config.max_model_len``.
-        on_warning:        Callback fired at ≥ 80 % KV cache utilization.
-                           Receives the utilization float (0.0–1.0).
-        on_shed_load:      Callback fired at ≥ 92 % KV cache utilization.
-                           Receives the utilization float (0.0–1.0).
-        poll_interval:     Seconds between block-manager polls (default 5 s).
-        cooldown_seconds:  Minimum seconds between repeated callback firings.
-        safety_ratio:      Fraction of available memory used as the budget.
-        min_num_seqs:      Binary-search floor — never reduce below this.
+        llm:                  A ``vllm.LLM``, ``vllm.AsyncLLMEngine``, or
+                              bare ``vllm.LLMEngine`` instance.
+        guard:                Optional ``MemoryGuard`` (auto-created if None).
+        **preflight_overrides: Any keyword argument accepted by
+                              ``MemoryGuard.preflight_inference()``.  Values
+                              passed here override the introspected defaults.
+                              Common overrides: ``max_num_seqs``,
+                              ``max_seq_len``, ``model_bits``.
 
     Returns:
-        ``(InferenceSafeConfig, KVCacheMonitor)`` — the preflight result and
-        an **unstarted** monitor.  Start it with ``monitor.start()`` or use
-        ``with monitor.session(): ...``.
+        ``InferenceSafeConfig`` with ``safe.monitor`` set to a wired-but-
+        unstarted ``KVCacheMonitor``.
 
     Raises:
         ImportError: if vLLM is not installed
@@ -111,41 +104,73 @@ def guard_vllm(
     """
     optional_import("vllm", "vllm")
 
+    if guard is None:
+        guard = MemoryGuard.auto(enable_calibration=False)
+
     engine = _get_llm_engine(llm)
     info = _extract_model_info(engine)
 
-    if max_seq_len is not None:
-        info["max_seq_len"] = max_seq_len
+    # --- back-calculate from vLLM's actual block allocation -----------------
+    cache_config = getattr(engine, "cache_config", None)
+    num_gpu_blocks: int = int(getattr(cache_config, "num_gpu_blocks", 0) or 0)
+    block_size: int = int(getattr(cache_config, "block_size", 16) or 16)
+    block_size = max(1, block_size)
 
-    if max_num_seqs is None:
+    if num_gpu_blocks > 0 and "max_num_seqs" not in preflight_overrides:
+        blocks_per_seq = max(1, math.ceil(info["max_seq_len"] / block_size))
+        actual_max_seqs = max(1, num_gpu_blocks // blocks_per_seq)
+        preflight_overrides = {"max_num_seqs": actual_max_seqs, **preflight_overrides}
+        logger.debug(
+            "[memory-guard] vLLM cache_config: %d blocks (block_size=%d) "
+            "→ %d max_num_seqs at seq_len=%d",
+            num_gpu_blocks, block_size, actual_max_seqs, info["max_seq_len"],
+        )
+    elif "max_num_seqs" not in preflight_overrides:
         sc = getattr(engine, "scheduler_config", None)
-        max_num_seqs = getattr(sc, "max_num_seqs", 256) if sc else 256
+        preflight_overrides = {
+            "max_num_seqs": getattr(sc, "max_num_seqs", 256) if sc else 256,
+            **preflight_overrides,
+        }
 
-    if available_mb is None:
-        from ..platforms import get_available_memory_mb
-        available_mb = get_available_memory_mb()
-
-    budget_mb = available_mb * safety_ratio
-
-    safe_config = _run_preflight(
-        info=info,
-        max_num_seqs=max_num_seqs,
-        min_num_seqs=min_num_seqs,
-        available_mb=available_mb,
-        budget_mb=budget_mb,
+    # --- run preflight with introspected + caller-supplied values -----------
+    safe = guard.preflight_inference(
+        model_params=info["model_params"],
+        model_bits=info["model_bits"],
+        num_kv_heads=info["num_kv_heads"],
+        head_dim=info["head_dim"],
+        num_layers=info["num_layers"],
+        max_seq_len=info["max_seq_len"],
+        dtype_bytes=info["dtype_bytes"],
+        hidden_dim=info["hidden_dim"],
+        **preflight_overrides,
     )
 
-    poll_fn = _make_poll_fn(engine)
+    # --- refine gpu_memory_utilization from actual KV allocation ------------
+    if num_gpu_blocks > 0:
+        actual_kv_mb = (
+            num_gpu_blocks
+            * block_size
+            * 2
+            * info["num_layers"]
+            * info["num_kv_heads"]
+            * info["head_dim"]
+            * info["dtype_bytes"]
+        ) / (1024 * 1024)
+        available = guard.available_mb
+        if available > 0:
+            safe.gpu_memory_utilization = round(
+                min(0.95, actual_kv_mb / available), 4
+            )
+        logger.debug(
+            "[memory-guard] vLLM actual KV cache: %.0f MB "
+            "(%d blocks × block_size %d)",
+            actual_kv_mb, num_gpu_blocks, block_size,
+        )
 
-    monitor = KVCacheMonitor(
-        poll_fn=poll_fn,
-        poll_interval=poll_interval,
-        on_warning=on_warning,
-        on_shed_load=on_shed_load,
-        cooldown_seconds=cooldown_seconds,
-    )
+    # --- wire monitor to block manager --------------------------------------
+    safe.monitor = KVCacheMonitor(poll_fn=_make_poll_fn(engine))
 
-    return safe_config, monitor
+    return safe
 
 
 # ---------------------------------------------------------------------------
@@ -170,16 +195,17 @@ def _get_llm_engine(llm: object) -> object:
 def _extract_model_info(engine: object) -> dict:
     """Read model architecture metadata from a vLLM LLMEngine.
 
-    Returns a dict with keys matching ``estimate_serving_memory()`` kwargs:
-    ``model_params``, ``model_bits``, ``num_kv_heads``, ``head_dim``,
-    ``num_layers``, ``max_seq_len``, ``dtype_bytes``, ``hidden_dim``.
+    Returns a dict with keys matching ``preflight_inference()`` parameters.
+    Falls back to conservative defaults for any missing field.
     """
     mc = getattr(engine, "model_config", None)
     hf = getattr(mc, "hf_config", None) if mc else None
 
     # --- attention geometry -------------------------------------------------
     num_heads: int = getattr(hf, "num_attention_heads", 32) if hf else 32
-    num_kv_heads: int = getattr(hf, "num_key_value_heads", num_heads) if hf else num_heads
+    num_kv_heads: int = (
+        getattr(hf, "num_key_value_heads", num_heads) if hf else num_heads
+    )
     num_layers: int = getattr(hf, "num_hidden_layers", 32) if hf else 32
     hidden_size: int = getattr(hf, "hidden_size", 4096) if hf else 4096
     head_dim: int = hidden_size // num_heads if num_heads > 0 else 128
@@ -206,14 +232,11 @@ def _extract_model_info(engine: object) -> dict:
     elif quantization in _8BIT:
         model_bits = 8
     else:
-        model_bits = 16  # unquantized fp16/bf16
+        model_bits = 16
 
     # --- parameter count ----------------------------------------------------
-    # Prefer hf_config attribute; fall back to a standard transformer estimate.
     num_params: int = getattr(hf, "num_parameters", 0) if hf else 0
     if num_params == 0:
-        # Standard transformer approximation: 12 × H² × L
-        # (attention + FFN params per layer, reasonable for most LLMs)
         num_params = int(12 * (hidden_size ** 2) * num_layers)
 
     return {
@@ -233,11 +256,13 @@ def _extract_model_info(engine: object) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _make_poll_fn(engine: object) -> Callable[[], tuple[int, int]]:
+def _make_poll_fn(engine: object):
     """Return a zero-argument callable that reads ``(used, total)`` GPU blocks.
 
-    Accesses ``engine.scheduler.block_manager``.  In vLLM ≥ 0.4.0, the
+    Accesses ``engine.scheduler.block_manager``.  In vLLM ≥ 0.4.0 the
     scheduler may be a list; the first element is used in that case.
+    Falls back to a null poll (returns ``(0, 1)``) if the block manager is
+    not accessible, with a one-time warning.
     """
     scheduler = getattr(engine, "scheduler", None)
     if isinstance(scheduler, list):
@@ -253,7 +278,7 @@ def _make_poll_fn(engine: object) -> Callable[[], tuple[int, int]]:
         )
 
         def _null_poll() -> tuple[int, int]:
-            return 0, 1  # utilization = 0 (harmless no-op)
+            return 0, 1
 
         return _null_poll
 
@@ -264,84 +289,3 @@ def _make_poll_fn(engine: object) -> Callable[[], tuple[int, int]]:
         return used, total
 
     return _poll
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers — preflight binary search
-# ---------------------------------------------------------------------------
-
-
-def _run_preflight(
-    info: dict,
-    max_num_seqs: int,
-    min_num_seqs: int,
-    available_mb: float,
-    budget_mb: float,
-) -> InferenceSafeConfig:
-    """Binary-search for the largest ``max_num_seqs`` within *budget_mb*.
-
-    Mirrors ``MemoryGuard.preflight_inference()`` but accepts an explicit
-    budget so the adapter can pass a caller-supplied or auto-detected value.
-    """
-    _kw = {k: v for k, v in info.items() if k != "max_seq_len"}
-    _kw["max_seq_len"] = info["max_seq_len"]
-
-    # Fast path — requested config fits
-    est = estimate_serving_memory(max_num_seqs=max_num_seqs, **_kw)
-    if est.fits_in(budget_mb):
-        gpu_util = min(0.95, est.total_mb / available_mb) if available_mb > 0 else 0.90
-        return InferenceSafeConfig(
-            max_num_seqs=max_num_seqs,
-            max_seq_len=info["max_seq_len"],
-            gpu_memory_utilization=round(gpu_util, 4),
-            estimate=est,
-            budget_mb=budget_mb,
-            available_mb=available_mb,
-            fits=True,
-            changes=[],
-        )
-
-    logger.warning(
-        "[memory-guard] vLLM preflight: %d seqs × %d tokens = %.0f MB "
-        "exceeds budget %.0f MB. Binary-searching for safe max_num_seqs...",
-        max_num_seqs, info["max_seq_len"], est.total_mb, budget_mb,
-    )
-
-    lo, hi = min_num_seqs, max_num_seqs
-    safe_seqs: Optional[int] = None
-    safe_est: Optional[InferenceServingEstimate] = None
-
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        candidate = estimate_serving_memory(max_num_seqs=mid, **_kw)
-        if candidate.fits_in(budget_mb):
-            safe_seqs = mid
-            safe_est = candidate
-            lo = mid + 1
-        else:
-            hi = mid - 1
-
-    fits = safe_seqs is not None
-    if not fits:
-        safe_seqs = min_num_seqs
-        safe_est = estimate_serving_memory(max_num_seqs=min_num_seqs, **_kw)
-
-    gpu_util = min(0.95, safe_est.total_mb / available_mb) if available_mb > 0 else 0.90
-    changes = [f"max_num_seqs reduced {max_num_seqs} → {safe_seqs}"]
-
-    logger.warning(
-        "[memory-guard] vLLM safe max_num_seqs: %d (%.0f MB). "
-        "Suggested: vllm --max-num-seqs=%d --gpu-memory-utilization=%.4f",
-        safe_seqs, safe_est.total_mb, safe_seqs, gpu_util,
-    )
-
-    return InferenceSafeConfig(
-        max_num_seqs=safe_seqs,
-        max_seq_len=info["max_seq_len"],
-        gpu_memory_utilization=round(gpu_util, 4),
-        estimate=safe_est,
-        budget_mb=budget_mb,
-        available_mb=available_mb,
-        fits=fits,
-        changes=changes,
-    )

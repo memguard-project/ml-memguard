@@ -13,8 +13,11 @@ into a single, easy-to-use API.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from .inference_monitor import KVCacheMonitor
 
 from .downgrade import DowngradeResult, auto_downgrade
 from .estimator import InferenceServingEstimate, MemoryEstimate, estimate_serving_memory, estimate_training_memory
@@ -75,6 +78,9 @@ class InferenceSafeConfig:
     available_mb: float
     fits: bool
     changes: list[str]
+    monitor: Optional[KVCacheMonitor] = field(
+        default=None, compare=False, repr=False
+    )
 
     def __str__(self) -> str:
         status = "FITS" if self.fits else "DOES NOT FIT"

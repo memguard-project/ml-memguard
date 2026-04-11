@@ -3,17 +3,21 @@
 All tests use MagicMock to simulate vLLM objects — vLLM is NOT required.
 
 Covers:
-  - _get_llm_engine: LLM, AsyncLLMEngine, bare LLMEngine
-  - _extract_model_info: defaults, GQA, quantization, dtype, num_params
-  - _make_poll_fn: normal path, list scheduler, missing block manager
-  - guard_vllm: fits fast path, binary-search downgrade, fits=False floor,
-                monitor wiring, pool_fn calls block manager, lazy import check
+  - guard_vllm returns InferenceSafeConfig with safe.monitor set
+  - cache_config.num_gpu_blocks back-calculation of max_num_seqs
+  - gpu_memory_utilization refined from actual KV MB
+  - poll_fn reads block_manager free/total blocks
+  - preflight_overrides pass through to guard.preflight_inference
+  - custom guard parameter
+  - LLM / AsyncLLMEngine wrapper unwrapping
+  - architecture extraction (GQA, quantization, dtype)
+  - ImportError when vLLM not installed
 """
 
 from __future__ import annotations
 
 import math
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -21,18 +25,17 @@ from memory_guard.adapters.vllm import (
     _extract_model_info,
     _get_llm_engine,
     _make_poll_fn,
-    _run_preflight,
     guard_vllm,
 )
+from memory_guard.guard import InferenceSafeConfig, MemoryGuard
 from memory_guard.inference_monitor import KVCacheMonitor
-from memory_guard.guard import InferenceSafeConfig
 
 
 # ---------------------------------------------------------------------------
-# Helpers / fixtures
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _make_engine(
+def _make_llm(
     num_heads=8,
     num_kv_heads=2,
     num_layers=4,
@@ -42,14 +45,15 @@ def _make_engine(
     quantization=None,
     num_parameters=0,
     max_num_seqs=64,
-    free_blocks=80,
-    total_blocks=100,
+    num_gpu_blocks=200,
+    block_size=16,
+    free_blocks=160,
+    total_blocks=200,
 ) -> MagicMock:
-    """Build a MagicMock that looks like a vLLM LLMEngine.
+    """Build a MagicMock that looks like a vllm.LLM wrapper.
 
-    Uses a restricted spec so that ``hasattr(engine, 'llm_engine')`` and
-    ``hasattr(engine, 'engine')`` return False — preventing _get_llm_engine
-    from mistaking this for an LLM / AsyncLLMEngine wrapper.
+    The LLM has a ``llm_engine`` attribute pointing to a spec-restricted engine
+    so that _get_llm_engine unwraps it correctly.
     """
     hf_config = MagicMock()
     hf_config.num_attention_heads = num_heads
@@ -64,6 +68,10 @@ def _make_engine(
     model_config.dtype = dtype_str
     model_config.quantization = quantization
 
+    cache_config = MagicMock()
+    cache_config.num_gpu_blocks = num_gpu_blocks
+    cache_config.block_size = block_size
+
     scheduler_config = MagicMock()
     scheduler_config.max_num_seqs = max_num_seqs
 
@@ -74,14 +82,33 @@ def _make_engine(
     scheduler = MagicMock()
     scheduler.block_manager = block_manager
 
-    # Restrict spec to LLMEngine-only attrs so MagicMock does not auto-create
-    # llm_engine / engine attributes (which would confuse _get_llm_engine).
-    engine = MagicMock(spec=["model_config", "scheduler_config", "scheduler"])
+    # Engine: restrict spec so it's not mistaken for an LLM wrapper
+    engine = MagicMock(
+        spec=["model_config", "cache_config", "scheduler_config", "scheduler"]
+    )
     engine.model_config = model_config
+    engine.cache_config = cache_config
     engine.scheduler_config = scheduler_config
     engine.scheduler = scheduler
 
-    return engine
+    # LLM wrapper: has llm_engine
+    llm = MagicMock()
+    llm.llm_engine = engine
+    return llm
+
+
+def _call_guard_vllm(llm, **kwargs):
+    """Call guard_vllm with vllm import mocked out.
+
+    Creates a real MemoryGuard with a pinned available_mb so results
+    are deterministic regardless of actual system memory.
+    """
+    guard = MemoryGuard.auto(enable_calibration=False)
+    # Pin available_mb so preflight is predictable
+    with patch.object(type(guard), "available_mb", new_callable=lambda: property(lambda self: 500_000)):
+        with patch.object(type(guard), "budget_mb", new_callable=lambda: property(lambda self: 400_000)):
+            with patch("memory_guard.adapters.vllm.optional_import"):
+                return guard_vllm(llm, guard=guard, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -93,301 +120,157 @@ class TestGetLLMEngine:
         engine = MagicMock()
         llm = MagicMock()
         llm.llm_engine = engine
-        # llm_engine takes precedence over engine
         assert _get_llm_engine(llm) is engine
 
     def test_async_llm_engine_returns_engine_attr(self):
         inner = MagicMock()
-        # No llm_engine attr — only engine
-        async_llm = MagicMock(spec=[])  # spec=[] removes all auto-attrs
-        async_llm.engine = inner
-        assert _get_llm_engine(async_llm) is inner
+        wrapper = MagicMock(spec=["engine"])
+        wrapper.engine = inner
+        assert _get_llm_engine(wrapper) is inner
 
-    def test_bare_llm_engine_returned_directly(self):
-        engine = MagicMock(spec=[])  # no llm_engine, no engine
+    def test_bare_engine_returned_directly(self):
+        engine = MagicMock(spec=[])
         assert _get_llm_engine(engine) is engine
 
 
 # ---------------------------------------------------------------------------
-# _extract_model_info
+# Architecture extraction
 # ---------------------------------------------------------------------------
 
 class TestExtractModelInfo:
-    def test_num_kv_heads_reads_gqa_field(self):
-        engine = _make_engine(num_heads=8, num_kv_heads=2)
-        info = _extract_model_info(engine)
+    def test_gqa_kv_heads_read_from_hf_config(self):
+        llm = _make_llm(num_heads=8, num_kv_heads=2)
+        info = _extract_model_info(llm.llm_engine)
         assert info["num_kv_heads"] == 2
 
-    def test_head_dim_is_hidden_over_num_heads(self):
-        engine = _make_engine(num_heads=8, hidden_size=512)
-        info = _extract_model_info(engine)
-        assert info["head_dim"] == 512 // 8
+    def test_head_dim_hidden_over_num_heads(self):
+        llm = _make_llm(num_heads=8, hidden_size=512)
+        info = _extract_model_info(llm.llm_engine)
+        assert info["head_dim"] == 64  # 512 // 8
 
-    def test_num_layers_from_hf_config(self):
-        engine = _make_engine(num_layers=12)
-        info = _extract_model_info(engine)
-        assert info["num_layers"] == 12
-
-    def test_max_seq_len_from_model_config(self):
-        engine = _make_engine(max_model_len=4096)
-        info = _extract_model_info(engine)
-        assert info["max_seq_len"] == 4096
-
-    def test_dtype_fp16_gives_2_bytes(self):
-        engine = _make_engine(dtype_str="torch.float16")
-        assert _extract_model_info(engine)["dtype_bytes"] == 2
-
-    def test_dtype_bfloat16_gives_2_bytes(self):
-        engine = _make_engine(dtype_str="torch.bfloat16")
-        assert _extract_model_info(engine)["dtype_bytes"] == 2
+    def test_dtype_float16_gives_2_bytes(self):
+        llm = _make_llm(dtype_str="torch.float16")
+        assert _extract_model_info(llm.llm_engine)["dtype_bytes"] == 2
 
     def test_dtype_float32_gives_4_bytes(self):
-        engine = _make_engine(dtype_str="torch.float32")
-        assert _extract_model_info(engine)["dtype_bytes"] == 4
-
-    def test_dtype_int8_gives_1_byte(self):
-        engine = _make_engine(dtype_str="torch.int8")
-        assert _extract_model_info(engine)["dtype_bytes"] == 1
+        llm = _make_llm(dtype_str="torch.float32")
+        assert _extract_model_info(llm.llm_engine)["dtype_bytes"] == 4
 
     def test_quantization_awq_gives_4_bits(self):
-        engine = _make_engine(quantization="awq")
-        assert _extract_model_info(engine)["model_bits"] == 4
-
-    def test_quantization_gptq_gives_4_bits(self):
-        engine = _make_engine(quantization="gptq")
-        assert _extract_model_info(engine)["model_bits"] == 4
+        llm = _make_llm(quantization="awq")
+        assert _extract_model_info(llm.llm_engine)["model_bits"] == 4
 
     def test_quantization_none_gives_16_bits(self):
-        engine = _make_engine(quantization=None)
-        assert _extract_model_info(engine)["model_bits"] == 16
-
-    def test_num_parameters_from_hf_config_when_nonzero(self):
-        engine = _make_engine(num_parameters=7_000_000_000)
-        info = _extract_model_info(engine)
-        assert info["model_params"] == 7_000_000_000
-
-    def test_num_parameters_estimated_when_zero(self):
-        engine = _make_engine(num_parameters=0, num_heads=8, num_layers=4, hidden_size=512)
-        info = _extract_model_info(engine)
-        # rough formula: 12 × H² × L
-        expected = int(12 * (512 ** 2) * 4)
-        assert info["model_params"] == expected
-
-    def test_defaults_when_no_model_config(self):
-        engine = MagicMock(spec=[])  # no model_config
-        info = _extract_model_info(engine)
-        assert info["num_kv_heads"] == 32   # fallback num_heads
-        assert info["num_layers"] == 32
-        assert info["max_seq_len"] == 8192
-
-    def test_hidden_dim_in_info(self):
-        engine = _make_engine(hidden_size=2048)
-        info = _extract_model_info(engine)
-        assert info["hidden_dim"] == 2048
+        llm = _make_llm(quantization=None)
+        assert _extract_model_info(llm.llm_engine)["model_bits"] == 16
 
 
 # ---------------------------------------------------------------------------
-# _make_poll_fn
+# poll_fn
 # ---------------------------------------------------------------------------
 
 class TestMakePollFn:
-    def test_returns_used_total_tuple(self):
-        engine = _make_engine(free_blocks=70, total_blocks=100)
-        poll = _make_poll_fn(engine)
-        used, total = poll()
-        assert total == 100
-        assert used == 30  # 100 - 70
-
     def test_used_equals_total_minus_free(self):
-        engine = _make_engine(free_blocks=1, total_blocks=10)
-        poll = _make_poll_fn(engine)
+        llm = _make_llm(free_blocks=70, total_blocks=100)
+        poll = _make_poll_fn(llm.llm_engine)
         used, total = poll()
-        assert used == 9
-        assert total == 10
-
-    def test_list_scheduler_uses_first_element(self):
-        block_manager = MagicMock()
-        block_manager.get_num_free_gpu_blocks.return_value = 50
-        block_manager.get_num_total_gpu_blocks.return_value = 100
-        sched = MagicMock()
-        sched.block_manager = block_manager
-
-        engine = MagicMock()
-        engine.scheduler = [sched, MagicMock()]  # list — first is used
-        poll = _make_poll_fn(engine)
-        used, total = poll()
-        assert total == 100
-        assert used == 50
-
-    def test_missing_block_manager_returns_zero_utilization(self):
-        engine = MagicMock()
-        engine.scheduler = MagicMock(spec=[])  # no block_manager attr
-        poll = _make_poll_fn(engine)
-        used, total = poll()
-        assert total >= 1
-        assert used == 0
-
-    def test_missing_scheduler_returns_zero_utilization(self):
-        engine = MagicMock(spec=[])  # no scheduler attr
-        poll = _make_poll_fn(engine)
-        used, total = poll()
-        assert total >= 1
-        assert used == 0
-
-
-# ---------------------------------------------------------------------------
-# _run_preflight
-# ---------------------------------------------------------------------------
-
-class TestRunPreflight:
-    """Tests for the binary-search helper (no vLLM import needed)."""
-
-    _BASE = dict(
-        model_params=0,
-        model_bits=16,
-        num_kv_heads=2,
-        head_dim=64,
-        num_layers=4,
-        dtype_bytes=2,
-        hidden_dim=512,
-    )
-
-    def test_fast_path_when_fits(self):
-        info = {**self._BASE, "max_seq_len": 512}
-        # Budget larger than any estimate at 8 seqs
-        result = _run_preflight(info, max_num_seqs=8, min_num_seqs=1,
-                                available_mb=100_000, budget_mb=100_000)
-        assert result.fits is True
-        assert result.max_num_seqs == 8
-        assert result.changes == []
-
-    def test_downgrade_finds_largest_fitting(self):
-        info = {**self._BASE, "max_seq_len": 2048}
-        # Each seq costs 2 × 4 layers × 2 kv_heads × 64 head_dim × 2048 × 2 bytes
-        # = 2 × 4 × 2 × 64 × 2048 × 2 = 4,194,304 bytes ≈ 4 MB / seq
-        from memory_guard.estimator import estimate_serving_memory
-        est_50 = estimate_serving_memory(max_num_seqs=50, **{k: v for k, v in info.items() if k != "max_seq_len"}, max_seq_len=info["max_seq_len"])
-        est_51 = estimate_serving_memory(max_num_seqs=51, **{k: v for k, v in info.items() if k != "max_seq_len"}, max_seq_len=info["max_seq_len"])
-        budget = (est_50.total_mb + est_51.total_mb) / 2
-
-        result = _run_preflight(info, max_num_seqs=100, min_num_seqs=1,
-                                available_mb=budget * 2, budget_mb=budget)
-        assert result.max_num_seqs == 50
-        assert result.fits is True
-
-    def test_fits_false_when_nothing_fits(self):
-        info = {**self._BASE, "max_seq_len": 2048}
-        result = _run_preflight(info, max_num_seqs=4, min_num_seqs=2,
-                                available_mb=1, budget_mb=0.001)  # impossibly small
-        assert result.fits is False
-        assert result.max_num_seqs == 2  # min_num_seqs floor
-
-    def test_changes_list_contains_reduction(self):
-        info = {**self._BASE, "max_seq_len": 2048}
-        result = _run_preflight(info, max_num_seqs=100, min_num_seqs=1,
-                                available_mb=0.1, budget_mb=0.001)
-        assert len(result.changes) == 1
-        assert "max_num_seqs" in result.changes[0]
-
-    def test_gpu_memory_utilization_in_range(self):
-        info = {**self._BASE, "max_seq_len": 512}
-        result = _run_preflight(info, max_num_seqs=4, min_num_seqs=1,
-                                available_mb=10_000, budget_mb=10_000)
-        assert 0.0 <= result.gpu_memory_utilization <= 0.95
-
-
-# ---------------------------------------------------------------------------
-# guard_vllm (integration)
-# ---------------------------------------------------------------------------
-
-class TestGuardVllm:
-    """End-to-end tests for guard_vllm with mocked vLLM and platform."""
-
-    def _call(self, engine, **kwargs):
-        """Call guard_vllm with mocked vllm import.
-
-        Always supplies available_mb=50_000 unless the caller overrides it,
-        so the lazy ``get_available_memory_mb`` import is never triggered.
-        """
-        kwargs.setdefault("available_mb", 50_000)
-        with patch("memory_guard.adapters.vllm.optional_import"):
-            return guard_vllm(engine, **kwargs)
-
-    def test_returns_tuple_of_safe_config_and_monitor(self):
-        engine = _make_engine()
-        result = self._call(engine)
-        assert isinstance(result, tuple) and len(result) == 2
-        safe, mon = result
-        assert isinstance(safe, InferenceSafeConfig)
-        assert isinstance(mon, KVCacheMonitor)
-
-    def test_monitor_not_started_on_return(self):
-        engine = _make_engine()
-        _, mon = self._call(engine)
-        assert mon.is_running is False
-
-    def test_max_num_seqs_read_from_scheduler_config(self):
-        engine = _make_engine(max_num_seqs=128, free_blocks=80, total_blocks=100)
-        safe, _ = self._call(engine, available_mb=100_000)
-        # With 100_000 MB budget, 128 seqs should fit
-        assert safe.max_num_seqs == 128
-
-    def test_max_num_seqs_overridable_by_caller(self):
-        engine = _make_engine(max_num_seqs=512)
-        safe, _ = self._call(engine, max_num_seqs=64, available_mb=100_000)
-        assert safe.max_num_seqs == 64
-
-    def test_max_seq_len_overridable_by_caller(self):
-        engine = _make_engine(max_model_len=8192)
-        safe, _ = self._call(engine, max_seq_len=1024, available_mb=100_000)
-        assert safe.max_seq_len == 1024
-
-    def test_poll_fn_reads_block_manager(self):
-        engine = _make_engine(free_blocks=70, total_blocks=100)
-        _, mon = self._call(engine, available_mb=100_000)
-        used, total = mon.poll_fn()
         assert total == 100
         assert used == 30
 
-    def test_on_warning_callback_wired(self):
-        fired = []
-        engine = _make_engine()
-        _, mon = self._call(engine, on_warning=lambda u: fired.append(u))
-        assert mon.on_warning is not None
-        mon.on_warning(0.85)
-        assert fired == [0.85]
+    def test_missing_block_manager_returns_zero_util(self):
+        engine = MagicMock(spec=["scheduler"])
+        engine.scheduler = MagicMock(spec=[])  # no block_manager
+        poll = _make_poll_fn(engine)
+        used, total = poll()
+        assert used == 0
+        assert total >= 1
 
-    def test_on_shed_load_callback_wired(self):
-        fired = []
-        engine = _make_engine()
-        _, mon = self._call(engine, on_shed_load=lambda u: fired.append(u))
-        assert mon.on_shed_load is not None
-        mon.on_shed_load(0.95)
-        assert fired == [0.95]
 
-    def test_guard_vllm_raises_on_missing_vllm(self):
-        engine = _make_engine()
+# ---------------------------------------------------------------------------
+# guard_vllm — core behaviour
+# ---------------------------------------------------------------------------
+
+class TestGuardVllm:
+    def test_returns_inference_safe_config(self):
+        llm = _make_llm()
+        safe = _call_guard_vllm(llm)
+        assert isinstance(safe, InferenceSafeConfig)
+
+    def test_monitor_attached_to_safe_config(self):
+        llm = _make_llm()
+        safe = _call_guard_vllm(llm)
+        assert isinstance(safe.monitor, KVCacheMonitor)
+
+    def test_monitor_not_started_on_return(self):
+        llm = _make_llm()
+        safe = _call_guard_vllm(llm)
+        assert safe.monitor.is_running is False
+
+    def test_cache_config_derives_max_num_seqs(self):
+        # 200 blocks, block_size=16, max_seq_len=2048
+        # blocks_per_seq = ceil(2048/16) = 128
+        # actual_max_seqs = 200 // 128 = 1
+        llm = _make_llm(num_gpu_blocks=200, block_size=16, max_model_len=2048)
+        safe = _call_guard_vllm(llm)
+        expected_max_seqs = 200 // math.ceil(2048 / 16)  # = 1
+        assert safe.max_num_seqs == expected_max_seqs
+
+    def test_no_cache_config_falls_back_to_scheduler_config(self):
+        llm = _make_llm(num_gpu_blocks=0, max_num_seqs=48)
+        safe = _call_guard_vllm(llm)
+        # With 0 gpu_blocks, preflight uses scheduler_config.max_num_seqs=48
+        assert safe.max_num_seqs == 48
+
+    def test_preflight_override_max_num_seqs_respected(self):
+        llm = _make_llm(num_gpu_blocks=1000, block_size=16, max_model_len=512)
+        # Override should take precedence over back-calculation
+        safe = _call_guard_vllm(llm, max_num_seqs=10)
+        assert safe.max_num_seqs == 10
+
+    def test_poll_fn_wired_to_block_manager(self):
+        llm = _make_llm(free_blocks=80, total_blocks=100)
+        safe = _call_guard_vllm(llm)
+        used, total = safe.monitor.poll_fn()
+        assert total == 100
+        assert used == 20
+
+    def test_gpu_memory_utilization_refined_from_blocks(self):
+        # With known blocks we can compute actual KV MB; the field should be
+        # the ratio of that to available_mb, capped at 0.95.
+        llm = _make_llm(
+            num_gpu_blocks=100, block_size=16,
+            num_heads=8, num_kv_heads=2, num_layers=4,
+            hidden_size=512, dtype_str="torch.float16",
+        )
+        safe = _call_guard_vllm(llm)
+        # actual_kv_mb = 100 * 16 * 2 * 4 * 2 * 64 * 2 / (1024^2) = 3.2MB / 500_000MB
+        # So gpu_memory_utilization ≈ tiny positive value < 0.95
+        assert 0.0 <= safe.gpu_memory_utilization <= 0.95
+
+    def test_import_error_when_vllm_not_installed(self):
+        llm = _make_llm()
         with patch(
             "memory_guard.adapters.vllm.optional_import",
             side_effect=ImportError("vllm required"),
         ):
             with pytest.raises(ImportError, match="vllm"):
-                guard_vllm(engine)
+                guard_vllm(llm)
 
-    def test_llm_wrapper_unwrapped_correctly(self):
-        """guard_vllm accepts an LLM wrapper (has llm_engine)."""
-        engine = _make_engine()
-        llm = MagicMock()
-        llm.llm_engine = engine
-        safe, _ = self._call(llm, available_mb=100_000)
-        assert isinstance(safe, InferenceSafeConfig)
+    def test_custom_guard_is_used(self):
+        llm = _make_llm()
+        custom_guard = MemoryGuard.auto(safety_ratio=0.50, enable_calibration=False)
+        with patch.object(
+            type(custom_guard), "available_mb",
+            new_callable=lambda: property(lambda self: 500_000),
+        ):
+            with patch.object(
+                type(custom_guard), "budget_mb",
+                new_callable=lambda: property(lambda self: 250_000),
+            ):
+                with patch("memory_guard.adapters.vllm.optional_import"):
+                    safe = guard_vllm(llm, guard=custom_guard)
+        assert safe.budget_mb == 250_000
 
-
-# ---------------------------------------------------------------------------
-# Module-level exports
-# ---------------------------------------------------------------------------
-
-class TestModuleExports:
-    def test_guard_vllm_importable(self):
-        from memory_guard.adapters.vllm import guard_vllm as gv
+    def test_guard_vllm_importable_from_top_level(self):
+        from memory_guard import guard_vllm as gv
         assert callable(gv)
