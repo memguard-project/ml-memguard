@@ -1,80 +1,73 @@
 """SGLang adapter for memory-guard.
 
 Provides:
-    guard_sglang — introspect a running SGLang engine, run preflight_inference()
-                   to find a safe max_running_requests, and wire a KVCacheMonitor
-                   to the engine's KV cache memory pool.
+    guard_sglang(engine, guard=None, **preflight_overrides) -> InferenceSafeConfig
+
+    One-call setup: introspects the running engine, calls
+    ``guard.preflight_inference()``, wires a smoothed ``KVCacheMonitor`` to the
+    token pool, and returns an ``InferenceSafeConfig`` with ``safe.monitor`` set.
 
 Design contract (ADR 003)
 --------------------------
-``guard_sglang`` constructs and returns a ``KVCacheMonitor``.  It never calls
-into the engine except through the returned monitor's ``poll_fn``.  The
-``poll_fn`` reads ``used_tokens`` and ``total_tokens`` from the token memory
-pool but never writes to it.  All load-shedding decisions are delegated to the
-caller via ``on_warning`` and ``on_shed_load`` callbacks.
+``guard_sglang`` never mutates the running engine.  The ``KVCacheMonitor``
+at ``safe.monitor`` only reads token-pool counters from a daemon thread.
+All load-shedding decisions are delegated to the caller via ``on_warning`` /
+``on_shed_load`` callbacks on the monitor.
 
-SGLang KV cache metrics
-------------------------
-SGLang's ``TokenizerManager`` and the internal ``ModelRunner`` expose KV block
-occupancy through the radix attention cache.  The preferred path is:
+Rolling-max smoothing
+---------------------
+SGLang's RadixAttention prefix-cache evicts KV token slots when a cached
+prefix is freed, causing utilization to drop suddenly.  Without smoothing,
+such drops reset the cooldown and delay the next shed-load signal.
 
-    engine.token_to_kv_pool.get_available_size()   # free tokens
-    engine.token_to_kv_pool.size                   # total tokens
+To avoid false positives the ``poll_fn`` applies a **3-reading rolling
+maximum**: it tracks the last three raw utilization values and reports the
+maximum of those readings.  This suppresses transient drops (prefix eviction)
+while still allowing the signal to clear once pressure genuinely recedes for
+three consecutive polls.
 
-If the pool is not directly accessible (older SGLang releases, pre-built
-containers), the adapter falls back to scheduler statistics:
+Token pool paths
+-----------------
+Tried in order:
 
-    engine.scheduler.get_stats().num_used_tokens
-    engine.scheduler.get_stats().num_total_tokens
+1. ``engine.token_to_kv_pool`` (SGLang ≥ 0.3.0)
+   - ``.size``                 → total token slots
+   - ``.get_available_size()`` → free token slots
 
-If neither path is available, the monitor returns zero utilization (safe but
-invisible) and logs a warning so operators know to upgrade or configure a
-custom ``poll_fn``.
+2. ``engine.mem_pool`` (older SGLang)
+   - ``.size``         → total token slots
+   - ``.available``    → free token slots (attribute, not method)
 
-Supported SGLang object types
--------------------------------
-- ``sglang.srt.server.Runtime``         — the high-level runtime object; the
-                                          adapter follows ``runtime.engine``
-                                          to reach the inner engine.
-- ``sglang.srt.managers.TokenizerManager`` — the async serving manager; holds
-                                              ``scheduler`` and access to the
-                                              KV pool via the scheduler's
-                                              ``tp_worker``.
-- ``sglang.srt.server_args.ServerArgs`` is NOT accepted — this adapter works
-                                         only with already-running engines.
+3. Null fallback — returns ``(0, 1)`` with a one-time warning.
 
 Usage::
 
     import sglang as sgl
-    from memory_guard.adapters.sglang import guard_sglang
+    from memory_guard import guard_sglang
 
     runtime = sgl.Runtime(model_path="meta-llama/Meta-Llama-3-8B", ...)
 
-    safe, monitor = guard_sglang(
-        runtime,
-        on_shed_load=lambda u: load_balancer.set_weight("primary", 0),
-    )
+    safe = guard_sglang(runtime)
+    print(safe.max_num_seqs)            # pass to --max-running-requests
+    print(safe.gpu_memory_utilization)  # pass to --mem-fraction-static
 
-    print(safe)                         # InferenceSafeConfig
-    print(safe.max_num_seqs)            # Pass to SGLang --max-running-requests
-    print(safe.gpu_memory_utilization)  # Pass to SGLang --mem-fraction-static
-
-    with monitor.session():
+    with safe.monitor.session():
         runtime.wait()
 """
 
 from __future__ import annotations
 
+import collections
 import logging
 from typing import Callable, Optional
 
-from ..constants import MONITOR_POLL_INTERVAL, SAFETY_RATIO_DEFAULT
-from ..estimator import InferenceServingEstimate, estimate_serving_memory
-from ..guard import InferenceSafeConfig
+from ..guard import InferenceSafeConfig, MemoryGuard
 from ..inference_monitor import KVCacheMonitor
 from .base import optional_import
 
 logger = logging.getLogger(__name__)
+
+_ROLLING_MAX_WINDOW = 3
 
 
 # ---------------------------------------------------------------------------
@@ -84,51 +77,32 @@ logger = logging.getLogger(__name__)
 
 def guard_sglang(
     engine: object,
-    available_mb: Optional[float] = None,
-    max_num_seqs: Optional[int] = None,
-    max_seq_len: Optional[int] = None,
-    on_warning: Optional[Callable[[float], None]] = None,
-    on_shed_load: Optional[Callable[[float], None]] = None,
-    poll_interval: float = MONITOR_POLL_INTERVAL,
-    cooldown_seconds: float = 30.0,
-    safety_ratio: float = SAFETY_RATIO_DEFAULT,
-    min_num_seqs: int = 1,
-) -> tuple[InferenceSafeConfig, KVCacheMonitor]:
+    guard: Optional[MemoryGuard] = None,
+    **preflight_overrides,
+) -> InferenceSafeConfig:
     """Preflight check and KV cache monitor for a SGLang engine.
 
-    Reads the model architecture from the engine's server args / model config,
-    runs a binary search to find the largest ``max_running_requests`` that fits
-    in the GPU memory budget, and returns a wired-but-unstarted
-    ``KVCacheMonitor``.
+    Introspects ``engine.server_args`` for model configuration, calls
+    ``guard.preflight_inference()``, and wires a ``KVCacheMonitor`` with
+    a 3-reading rolling-max ``poll_fn`` to guard against false positives
+    from RadixAttention prefix-cache evictions.
 
-    The monitor polls the token KV pool from a daemon thread and fires
-    ``on_warning`` / ``on_shed_load`` callbacks — it never mutates the engine
-    (ADR 003).
+    If ``engine.token_to_kv_pool.size`` (or ``engine.mem_pool.size``) is
+    accessible, the adapter back-calculates ``max_num_seqs`` from the actual
+    token capacity, just as the vLLM adapter uses ``cache_config.num_gpu_blocks``.
 
     Args:
-        engine:            A ``sglang.srt.server.Runtime``,
-                           ``sglang.srt.managers.TokenizerManager``, or any
-                           SGLang engine object with accessible server args.
-        available_mb:      Available GPU memory in MB.  Auto-detected from
-                           CUDA if not provided.
-        max_num_seqs:      Max concurrent requests for the preflight check.
-                           Defaults to ``server_args.max_running_requests``
-                           (or 256 if not accessible).
-        max_seq_len:       Max sequence length.  Defaults to
-                           ``server_args.context_length``.
-        on_warning:        Callback fired at ≥ 80 % KV cache utilization.
-                           Receives the utilization float (0.0–1.0).
-        on_shed_load:      Callback fired at ≥ 92 % KV cache utilization.
-                           Receives the utilization float (0.0–1.0).
-        poll_interval:     Seconds between KV pool polls (default 5 s).
-        cooldown_seconds:  Minimum seconds between repeated callback firings.
-        safety_ratio:      Fraction of available memory used as the budget.
-        min_num_seqs:      Binary-search floor — never reduce below this.
+        engine:               A ``sglang.Runtime`` (unwrapped via ``.engine``),
+                              ``TokenizerManager``, or any SGLang engine object
+                              with ``server_args`` and a token pool.
+        guard:                Optional ``MemoryGuard`` (auto-created if None).
+        **preflight_overrides: Any keyword argument accepted by
+                              ``MemoryGuard.preflight_inference()``.  Values
+                              passed here override the introspected defaults.
 
     Returns:
-        ``(InferenceSafeConfig, KVCacheMonitor)`` — the preflight result and
-        an **unstarted** monitor.  Start it with ``monitor.start()`` or use
-        ``with monitor.session(): ...``.
+        ``InferenceSafeConfig`` with ``safe.monitor`` set to a wired-but-
+        unstarted ``KVCacheMonitor``.
 
     Raises:
         ImportError: if SGLang is not installed
@@ -136,113 +110,114 @@ def guard_sglang(
     """
     optional_import("sglang", "sglang")
 
+    if guard is None:
+        guard = MemoryGuard.auto(enable_calibration=False)
+
     inner = _get_inner_engine(engine)
     info = _extract_model_info(inner)
 
-    if max_seq_len is not None:
-        info["max_seq_len"] = max_seq_len
+    # --- back-calculate from SGLang's actual token pool ---------------------
+    pool = _find_token_pool(inner)
+    total_token_slots: int = _pool_total(pool)
 
-    if max_num_seqs is None:
-        server_args = _get_server_args(inner)
-        max_num_seqs = _safe_int(
-            getattr(server_args, "max_running_requests", None), default=256
+    if total_token_slots > 0 and "max_num_seqs" not in preflight_overrides:
+        actual_max_seqs = max(1, total_token_slots // info["max_seq_len"])
+        preflight_overrides = {"max_num_seqs": actual_max_seqs, **preflight_overrides}
+        logger.debug(
+            "[memory-guard] SGLang token pool: %d total slots / %d max_seq_len"
+            " → %d max_running_requests",
+            total_token_slots, info["max_seq_len"], actual_max_seqs,
         )
+    elif "max_num_seqs" not in preflight_overrides:
+        server_args = _get_server_args(inner)
+        preflight_overrides = {
+            "max_num_seqs": int(getattr(server_args, "max_running_requests", None) or 256),
+            **preflight_overrides,
+        }
 
-    if available_mb is None:
-        from ..platforms import get_available_memory_mb
-        available_mb = get_available_memory_mb()
-
-    budget_mb = available_mb * safety_ratio
-
-    safe_config = _run_preflight(
-        info=info,
-        max_num_seqs=max_num_seqs,
-        min_num_seqs=min_num_seqs,
-        available_mb=available_mb,
-        budget_mb=budget_mb,
+    # --- run preflight ------------------------------------------------------
+    safe = guard.preflight_inference(
+        model_params=info["model_params"],
+        model_bits=info["model_bits"],
+        num_kv_heads=info["num_kv_heads"],
+        head_dim=info["head_dim"],
+        num_layers=info["num_layers"],
+        max_seq_len=info["max_seq_len"],
+        dtype_bytes=info["dtype_bytes"],
+        hidden_dim=info["hidden_dim"],
+        **preflight_overrides,
     )
 
-    poll_fn = _make_poll_fn(inner)
+    # --- refine gpu_memory_utilization from actual pool ---------------------
+    if total_token_slots > 0:
+        actual_kv_mb = (
+            total_token_slots
+            * 2
+            * info["num_layers"]
+            * info["num_kv_heads"]
+            * info["head_dim"]
+            * info["dtype_bytes"]
+        ) / (1024 * 1024)
+        available = guard.available_mb
+        if available > 0:
+            safe.gpu_memory_utilization = round(
+                min(0.95, actual_kv_mb / available), 4
+            )
 
-    monitor = KVCacheMonitor(
-        poll_fn=poll_fn,
-        poll_interval=poll_interval,
-        on_warning=on_warning,
-        on_shed_load=on_shed_load,
-        cooldown_seconds=cooldown_seconds,
+    # --- build smoothed monitor ---------------------------------------------
+    raw_poll = _make_raw_poll_fn(inner, pool)
+    safe.monitor = KVCacheMonitor(
+        poll_fn=_make_smoothed_poll_fn(raw_poll, window=_ROLLING_MAX_WINDOW)
     )
 
-    return safe_config, monitor
+    return safe
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers — engine introspection
+# Internal helpers — engine unwrapping
 # ---------------------------------------------------------------------------
 
 
 def _get_inner_engine(engine: object) -> object:
-    """Unwrap a SGLang Runtime or similar wrapper to reach the inner engine.
+    """Unwrap a SGLang Runtime to reach the inner engine.
 
-    - ``sglang.Runtime`` exposes the engine as ``runtime.engine``
-    - ``TokenizerManager`` is returned directly
-    - Bare engine objects are returned as-is
+    ``sglang.Runtime`` exposes the inner engine via ``.engine``.
+    Objects that already have ``server_args`` at the top level are the inner
+    engine and are returned directly.
     """
-    # sglang.Runtime wraps the engine as .engine
     if hasattr(engine, "engine") and not hasattr(engine, "server_args"):
         return engine.engine
     return engine
 
 
 def _get_server_args(engine: object) -> object:
-    """Return the server_args object (or an empty MagicMock-like fallback)."""
-    return getattr(engine, "server_args", None) or _FallbackArgs()
+    """Return ``engine.server_args`` or a sentinel that returns None for any attr."""
+    return getattr(engine, "server_args", None) or _NoArgs()
 
 
-class _FallbackArgs:
-    """Provides None for any attribute access — used when server_args is absent."""
-
+class _NoArgs:
     def __getattr__(self, name: str) -> None:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — model architecture extraction
+# ---------------------------------------------------------------------------
 
 
 def _extract_model_info(engine: object) -> dict:
     """Read model architecture metadata from a SGLang engine.
 
-    SGLang stores model configuration in ``engine.server_args`` (a
-    ``ServerArgs`` dataclass) and in the model runner's HuggingFace config.
-    Falls back to conservative defaults for any missing field.
-
-    Returns a dict with keys matching ``estimate_serving_memory()`` kwargs.
+    Reads ``server_args`` for dtype, quantization, and sequence-length
+    limits.  Falls back to conservative defaults for any missing field.
     """
     server_args = _get_server_args(engine)
 
-    # --- HF config (if accessible via model runner) -------------------------
-    hf = None
-    model_runner = _deep_get(engine, "tp_worker", "model_runner")
-    if model_runner is None:
-        model_runner = _deep_get(engine, "scheduler", "tp_worker", "model_runner")
-    if model_runner is not None:
-        hf = getattr(
-            getattr(model_runner, "model", None),
-            "config",
-            None,
-        )
-
-    # --- attention geometry -------------------------------------------------
-    num_heads: int = _safe_int(getattr(hf, "num_attention_heads", None), 32) if hf else 32
-    num_kv_heads: int = (
-        _safe_int(getattr(hf, "num_key_value_heads", None), num_heads) if hf else num_heads
-    )
-    num_layers: int = _safe_int(getattr(hf, "num_hidden_layers", None), 32) if hf else 32
-    hidden_size: int = _safe_int(getattr(hf, "hidden_size", None), 4096) if hf else 4096
-    head_dim: int = hidden_size // num_heads if num_heads > 0 else 128
-
     # --- sequence length ----------------------------------------------------
-    # SGLang ServerArgs: context_length or max_total_tokens
-    max_seq_len: int = _safe_int(
+    max_seq_len: int = int(
         getattr(server_args, "context_length", None)
-        or getattr(server_args, "max_total_tokens", None),
-        default=8192,
+        or getattr(server_args, "max_total_tokens", None)
+        or 8192
     )
 
     # --- dtype → bytes ------------------------------------------------------
@@ -265,8 +240,16 @@ def _extract_model_info(engine: object) -> dict:
     else:
         model_bits = 16
 
+    # --- HF config (optional; accessible via tp_worker in some versions) ----
+    hf = _try_hf_config(engine)
+    num_heads: int = _safe_int(getattr(hf, "num_attention_heads", None), 32)
+    num_kv_heads: int = _safe_int(getattr(hf, "num_key_value_heads", None), num_heads)
+    num_layers: int = _safe_int(getattr(hf, "num_hidden_layers", None), 32)
+    hidden_size: int = _safe_int(getattr(hf, "hidden_size", None), 4096)
+    head_dim: int = hidden_size // num_heads if num_heads > 0 else 128
+
     # --- parameter count ----------------------------------------------------
-    num_params: int = _safe_int(getattr(hf, "num_parameters", None), 0) if hf else 0
+    num_params: int = _safe_int(getattr(hf, "num_parameters", None), 0)
     if num_params == 0:
         num_params = int(12 * (hidden_size ** 2) * num_layers)
 
@@ -282,32 +265,84 @@ def _extract_model_info(engine: object) -> dict:
     }
 
 
+def _try_hf_config(engine: object) -> Optional[object]:
+    """Attempt to reach model.config through tp_worker.model_runner."""
+    for path in (
+        ("tp_worker", "model_runner", "model", "config"),
+        ("scheduler", "tp_worker", "model_runner", "model", "config"),
+    ):
+        obj = engine
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        else:
+            return obj  # full path resolved
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — token pool access
+# ---------------------------------------------------------------------------
+
+
+def _find_token_pool(engine: object) -> Optional[object]:
+    """Return the first accessible token pool object, or None."""
+    # SGLang >= 0.3.0
+    pool = getattr(engine, "token_to_kv_pool", None)
+    if pool is not None:
+        return pool
+    # Older SGLang
+    pool = getattr(engine, "mem_pool", None)
+    if pool is not None:
+        return pool
+    return None
+
+
+def _pool_total(pool: Optional[object]) -> int:
+    """Return the total token capacity of *pool*, or 0 if unknown."""
+    if pool is None:
+        return 0
+    size = getattr(pool, "size", None)
+    if size is not None:
+        return _safe_int(size, 0)
+    return 0
+
+
+def _pool_free(pool: object) -> int:
+    """Return free token slots from *pool* (0 on failure)."""
+    # Preferred: callable get_available_size()
+    fn = getattr(pool, "get_available_size", None)
+    if callable(fn):
+        return _safe_int(fn(), 0)
+    # Fallback: plain attribute
+    return _safe_int(getattr(pool, "available", None), 0)
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers — poll_fn construction
 # ---------------------------------------------------------------------------
 
 
-def _make_poll_fn(engine: object) -> Callable[[], tuple[int, int]]:
-    """Return a zero-argument callable that reads ``(used_tokens, total_tokens)``.
+def _make_raw_poll_fn(
+    engine: object,
+    pool: Optional[object],
+) -> Callable[[], tuple[int, int]]:
+    """Return the raw (unsmoothed) ``(used, total)`` poll function.
 
-    Tries three paths in order of preference:
-
-    1. ``engine.token_to_kv_pool`` — preferred; a direct KV block pool.
-    2. ``engine.scheduler.get_stats()`` — scheduler-level stats object.
-    3. Null fallback (returns ``(0, 1)`` and logs a warning once).
+    Tries token pool → scheduler stats → null fallback.
     """
-    # Path 1: direct token_to_kv_pool
-    pool = getattr(engine, "token_to_kv_pool", None)
-    if pool is not None and callable(getattr(pool, "get_available_size", None)):
+    if pool is not None:
         def _poll_pool() -> tuple[int, int]:
-            total: int = _safe_int(getattr(pool, "size", None), 1) or 1
-            free: int = _safe_int(pool.get_available_size(), 0)
-            used: int = total - free
-            return used, total
+            total = _pool_total(pool)
+            if total == 0:
+                return 0, 1
+            free = _pool_free(pool)
+            return total - free, total
 
         return _poll_pool
 
-    # Path 2: scheduler stats
+    # Scheduler stats fallback
     scheduler = getattr(engine, "scheduler", None)
     if scheduler is not None and callable(getattr(scheduler, "get_stats", None)):
         def _poll_stats() -> tuple[int, int]:
@@ -318,11 +353,10 @@ def _make_poll_fn(engine: object) -> Callable[[], tuple[int, int]]:
 
         return _poll_stats
 
-    # Fallback
     logger.warning(
-        "[memory-guard] SGLang KV pool not found on engine. "
-        "KVCacheMonitor will return 0 utilization. "
-        "Verify you are using a supported SGLang version or pass a custom poll_fn."
+        "[memory-guard] SGLang: token pool not found. "
+        "KVCacheMonitor will report 0 utilization. "
+        "Verify you are using a supported SGLang version."
     )
 
     def _null_poll() -> tuple[int, int]:
@@ -331,80 +365,39 @@ def _make_poll_fn(engine: object) -> Callable[[], tuple[int, int]]:
     return _null_poll
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers — preflight binary search
-# ---------------------------------------------------------------------------
+def _make_smoothed_poll_fn(
+    raw_poll_fn: Callable[[], tuple[int, int]],
+    window: int = 3,
+) -> Callable[[], tuple[int, int]]:
+    """Wrap *raw_poll_fn* with a rolling-maximum over *window* readings.
 
+    SGLang's RadixAttention prefix-cache can evict large blocks of KV
+    memory at once, causing utilization to drop suddenly.  Without smoothing,
+    such a drop would reset the cooldown and delay the next shed-load signal.
 
-def _run_preflight(
-    info: dict,
-    max_num_seqs: int,
-    min_num_seqs: int,
-    available_mb: float,
-    budget_mb: float,
-) -> InferenceSafeConfig:
-    """Binary-search for the largest ``max_num_seqs`` within *budget_mb*."""
-    _kw = {k: v for k, v in info.items() if k != "max_seq_len"}
-    _kw["max_seq_len"] = info["max_seq_len"]
+    The rolling max suppresses these transient drops: the signal fires as
+    long as *any* of the last *window* readings was above the threshold.
+    Genuine pressure relief (all *window* readings below threshold) allows
+    the signal to clear naturally.
 
-    est = estimate_serving_memory(max_num_seqs=max_num_seqs, **_kw)
-    if est.fits_in(budget_mb):
-        gpu_util = min(0.95, est.total_mb / available_mb) if available_mb > 0 else 0.90
-        return InferenceSafeConfig(
-            max_num_seqs=max_num_seqs,
-            max_seq_len=info["max_seq_len"],
-            gpu_memory_utilization=round(gpu_util, 4),
-            estimate=est,
-            budget_mb=budget_mb,
-            available_mb=available_mb,
-            fits=True,
-            changes=[],
-        )
+    Args:
+        raw_poll_fn: The underlying ``(used, total)`` callable.
+        window:      Number of readings to keep for the rolling max (default 3).
 
-    logger.warning(
-        "[memory-guard] SGLang preflight: %d seqs × %d tokens = %.0f MB "
-        "exceeds budget %.0f MB. Binary-searching for safe max_running_requests...",
-        max_num_seqs, info["max_seq_len"], est.total_mb, budget_mb,
-    )
+    Returns:
+        A new ``poll_fn`` that returns ``(smoothed_used, total)`` where
+        ``smoothed_used / total == max(last *window* utilizations)``.
+    """
+    recent: collections.deque[float] = collections.deque(maxlen=window)
 
-    lo, hi = min_num_seqs, max_num_seqs
-    safe_seqs: Optional[int] = None
-    safe_est: Optional[InferenceServingEstimate] = None
+    def smoothed() -> tuple[int, int]:
+        used, total = raw_poll_fn()
+        util = used / total if total > 0 else 0.0
+        recent.append(util)
+        max_util = max(recent)
+        return int(max_util * total), total
 
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        candidate = estimate_serving_memory(max_num_seqs=mid, **_kw)
-        if candidate.fits_in(budget_mb):
-            safe_seqs = mid
-            safe_est = candidate
-            lo = mid + 1
-        else:
-            hi = mid - 1
-
-    fits = safe_seqs is not None
-    if not fits:
-        safe_seqs = min_num_seqs
-        safe_est = estimate_serving_memory(max_num_seqs=min_num_seqs, **_kw)
-
-    gpu_util = min(0.95, safe_est.total_mb / available_mb) if available_mb > 0 else 0.90
-    changes = [f"max_running_requests reduced {max_num_seqs} → {safe_seqs}"]
-
-    logger.warning(
-        "[memory-guard] SGLang safe max_running_requests: %d (%.0f MB). "
-        "Suggested: --max-running-requests=%d --mem-fraction-static=%.4f",
-        safe_seqs, safe_est.total_mb, safe_seqs, gpu_util,
-    )
-
-    return InferenceSafeConfig(
-        max_num_seqs=safe_seqs,
-        max_seq_len=info["max_seq_len"],
-        gpu_memory_utilization=round(gpu_util, 4),
-        estimate=safe_est,
-        budget_mb=budget_mb,
-        available_mb=available_mb,
-        fits=fits,
-        changes=changes,
-    )
+    return smoothed
 
 
 # ---------------------------------------------------------------------------
@@ -420,12 +413,3 @@ def _safe_int(value: object, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
-
-
-def _deep_get(obj: object, *attrs: str) -> object:
-    """Traverse a chain of attributes, returning None on any missing step."""
-    for attr in attrs:
-        obj = getattr(obj, attr, None)
-        if obj is None:
-            return None
-    return obj
