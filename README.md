@@ -512,9 +512,38 @@ Identical to `guard_trainer` but named for TRL `SFTTrainer` workflows.
 
 **Design constraint** (ADR 003): `guard_vllm` and `guard_sglang` emit signals only — they never mutate a running engine. Load-shedding requires a load balancer or health endpoint in front of the engine. See [`docs/adapters.md`](docs/adapters.md) for the full reference.
 
+## Supported Hardware
+
+**Tested** = verified on real hardware. **Reported** = community-reported. **Planned** = implementation exists, not yet verified on real hardware. **—** = not applicable.
+
+[→ Report your config](https://github.com/vgpprasad91/ml-memguard/issues/new?template=hardware_report.yml) | [→ Full hardware discussion](https://github.com/vgpprasad91/ml-memguard/discussions)
+
+| GPU / Device         | VRAM   | vLLM    | SGLang  | Unsloth | HF Trainer | mlx_lm  |
+|----------------------|--------|---------|---------|---------|------------|---------|
+| A100 40 GB           | 40 GB  | Planned | Planned | —       | Planned    | —       |
+| A100 80 GB           | 80 GB  | Planned | Planned | —       | Planned    | —       |
+| H100 80 GB           | 80 GB  | Planned | Planned | —       | Planned    | —       |
+| RTX 4090             | 24 GB  | Planned | Planned | Planned | Planned    | —       |
+| RTX 3090             | 24 GB  | Planned | Planned | Planned | Planned    | —       |
+| M1/M2 MacBook Air    | 8–16 GB | —      | Planned | —       | Planned    | Planned |
+| M3/M4 MacBook Pro    | 18–48 GB | —     | Planned | —       | Planned    | **Tested** |
+| M4 Max (36 GB)       | 36 GB  | —       | Planned | —       | Planned    | **Tested** |
+| CPU (Linux / macOS)  | —      | —       | —       | —       | **Tested** | —       |
+| AMD ROCm (RX 7900)   | 24 GB  | Planned | —       | —       | —          | —       |
+
+The M4 Max 36 GB + mlx_lm row is the only configuration verified end-to-end on real hardware.
+All other "Planned" entries have working code paths and pass unit tests but have not been
+verified against a running vLLM/SGLang server on those specific GPUs.
+
+**Help us fill in the gaps**: open a [Hardware Config Report](https://github.com/vgpprasad91/ml-memguard/issues/new?template=hardware_report.yml)
+with your GPU, framework, and whether memguard prevented an OOM.
+Each report turns a "Planned" into a "Reported" or "Tested" cell.
+
+---
+
 ## Estimation Accuracy
 
-Measured accuracy on real training runs. **We need your help expanding this table** — see [Contributing](#help-us-benchmark) below.
+Measured accuracy on real training runs. **We need your help expanding this table** — see [Contributing](#contributing) below.
 
 | Model | Device | Batch | Seq | Rank | Estimated | Actual | Error |
 |-------|--------|------:|----:|-----:|----------:|-------:|------:|

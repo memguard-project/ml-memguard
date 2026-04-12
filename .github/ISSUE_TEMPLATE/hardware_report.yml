@@ -1,0 +1,147 @@
+name: Hardware Config Report
+description: Share your GPU + framework config to expand the supported hardware matrix
+title: "[Hardware] <GPU model> + <Framework> — <OOM prevented / not prevented>"
+labels: ["hardware-report", "accuracy"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for submitting a hardware report. Each report improves OOM prediction accuracy
+        for everyone on that hardware class and expands the Supported Hardware matrix in the README.
+
+        **Quick report**: run `python -c "from memory_guard import guard_vllm; ..."` and paste
+        the `InferenceSafeConfig` block below. That's the whole report.
+
+  - type: dropdown
+    id: gpu_model
+    attributes:
+      label: GPU model
+      description: Select your GPU. Add in "Additional context" if not listed.
+      options:
+        - RTX 3060 (12 GB)
+        - RTX 3070 (8 GB)
+        - RTX 3080 (10 GB)
+        - RTX 3090 (24 GB)
+        - RTX 4070 (12 GB)
+        - RTX 4080 (16 GB)
+        - RTX 4090 (24 GB)
+        - A100 40 GB
+        - A100 80 GB
+        - H100 80 GB
+        - L40S (48 GB)
+        - M1 MacBook Air (8 GB)
+        - M1 MacBook Air (16 GB)
+        - M1 Max (32 GB)
+        - M2 MacBook Air (8 GB)
+        - M2 MacBook Air (16 GB)
+        - M2 Max (38 GB)
+        - M3 MacBook Pro (18 GB)
+        - M3 Max (36 GB)
+        - M4 MacBook Air (16 GB)
+        - M4 Max (36 GB)
+        - M4 Max (48 GB)
+        - AMD RX 7900 XTX (24 GB)
+        - AMD MI300X (192 GB)
+        - CPU only
+        - Other (specify in Additional context)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: framework
+    attributes:
+      label: Framework
+      options:
+        - vLLM
+        - SGLang
+        - Unsloth
+        - HuggingFace Trainer
+        - mlx_lm
+        - Other (specify in Additional context)
+    validations:
+      required: true
+
+  - type: input
+    id: framework_version
+    attributes:
+      label: Framework version
+      placeholder: "e.g. vLLM 0.4.3, SGLang 0.3.1, Unsloth 2024.12"
+    validations:
+      required: true
+
+  - type: input
+    id: model_name
+    attributes:
+      label: Model name
+      placeholder: "e.g. meta-llama/Llama-3.1-8B-Instruct"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: quantization
+    attributes:
+      label: Quantization
+      options:
+        - FP32
+        - FP16 / BF16
+        - INT8
+        - INT4 / GPTQ / AWQ
+        - 4-bit MLX
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: oom_prevented
+    attributes:
+      label: Did memguard prevent an OOM?
+      options:
+        - "Yes — shed load before the server crashed"
+        - "Yes — training estimate prevented a doomed run"
+        - "No — OOM still occurred (please describe)"
+        - "Not applicable — testing pre-flight only"
+        - "Uncertain"
+    validations:
+      required: true
+
+  - type: textarea
+    id: preflight_output
+    attributes:
+      label: Pre-flight output
+      description: |
+        Paste the InferenceSafeConfig block or training estimate block.
+        Run: `python -c "from memory_guard import guard_vllm; safe = guard_vllm(engine); print(safe)"`
+      placeholder: |
+        [memguard] InferenceSafeConfig
+          model:              meta-llama/Llama-3.1-8B-Instruct
+          gpu_total:          24,564 MB  (RTX 4090)
+          weights_mb:         15,258 MB
+          kv_budget:           5,586 MB
+          max_num_seqs:            12
+          status:              FITS
+    validations:
+      required: false
+
+  - type: input
+    id: os_version
+    attributes:
+      label: OS and CUDA version
+      placeholder: "e.g. Ubuntu 22.04 / CUDA 12.1, macOS 15.3"
+    validations:
+      required: true
+
+  - type: input
+    id: memguard_version
+    attributes:
+      label: ml-memguard version
+      placeholder: "e.g. 0.5.0  (run: pip show ml-memguard | grep Version)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Anything else — error messages, unexpected behavior, suggestions
+    validations:
+      required: false
