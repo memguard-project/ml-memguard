@@ -140,8 +140,8 @@ def _merge_cloud_policy(policy: "BanditPolicy") -> None:
     Never raises — cloud failures are silently ignored.
     """
     try:
-        from .cloud import download_policy
-        cloud_data = download_policy()
+        from .backends import download_policy as _download_policy
+        cloud_data = _download_policy()
         if not cloud_data or "q_table" not in cloud_data:
             return
 
@@ -493,8 +493,8 @@ class BanditPolicy:
 
         # Cloud sync — fire-and-forget; never blocks or raises
         try:
-            from .cloud import upload_policy
-            upload_policy(payload)
+            from .backends import upload_policy as _upload_policy
+            _upload_policy(payload)
         except Exception:
             pass
 

@@ -300,19 +300,12 @@ def main() -> None:
     p.add_argument("--poll-interval", type=float, default=5.0, dest="poll_interval",
                    help="Seconds between KV cache polls (default: 5.0)")
     p.add_argument("--model-name",    default="", dest="model_name",
-                   help="Model identifier forwarded to ml-memguard telemetry")
+                   help="Model identifier forwarded to the fleet backend")
     p.add_argument("--backend",       default="",
-                   help="Backend string forwarded to ml-memguard telemetry")
+                   help="Backend string forwarded to the fleet backend")
     p.add_argument("--smoothing-window", type=int, default=1, dest="smoothing_window",
                    help="Rolling-max window for KV utilization smoothing (default: 1; use 3 for SGLang)")
-    p.add_argument("--explain-telemetry", action="store_true", dest="explain_telemetry",
-                   help="Print the exact telemetry schema sent to ml-memguard and exit")
     args = p.parse_args()
-
-    if args.explain_telemetry:
-        from .telemetry_explain import print_schema
-        print_schema()
-        sys.exit(0)
 
     monitor = _build_monitor_from_args(
         vllm_url      = args.vllm_url,

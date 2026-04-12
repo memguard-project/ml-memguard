@@ -11,7 +11,6 @@ No more `gpu_memory_utilization` trial-and-error. No more KV cache crashes at 3 
 [![Works with SGLang](https://img.shields.io/badge/SGLang-%E2%89%A50.3-green.svg)](https://github.com/sgl-project/sglang)
 [![Works with Unsloth](https://img.shields.io/badge/Unsloth-supported-green.svg)](https://github.com/unslothai/unsloth)
 
-**→ [How much is your team wasting on OOM crashes? Find your number.](https://REDACTED)**
 
 ```bash
 pip install ml-memguard                  # core (zero dependencies)
@@ -611,31 +610,6 @@ Then open a [GitHub issue](https://github.com/memguard-project/ml-memguard/issue
 - **Framework adapters**: PyTorch Lightning, Axolotl, LitGPT wrappers (HF Transformers and Unsloth ship in v0.2.0; vLLM and SGLang in v0.3.0; RL optimizer in v0.4.0)
 - **Accuracy data**: Real training runs on CUDA or non-Apple hardware — see the table above
 - **Bug reports**: If the estimate was off by >30%, that's a bug — please report it with your config
-
-## Telemetry & Privacy
-
-When `MEMGUARD_BACKEND_KEY` is set, memguard sends anonymous hardware and memory
-metrics to improve OOM predictions across the fleet. **No model weights, training
-data, prompts, or file paths are ever collected.**
-
-What is sent: hardware config (backend, VRAM tier, quantization), memory usage
-curves (estimated vs actual MB), and OOM outcomes. Retention is 90 days.
-
-**To opt out:**
-
-```bash
-export MEMGUARD_TELEMETRY=off
-```
-
-To see the exact JSON schema:
-
-```bash
-memguard-explain-telemetry          # human-readable table
-memguard-explain-telemetry --json   # machine-readable
-memguard-sidecar --explain-telemetry
-```
-
-Full privacy documentation: [docs/privacy.md](docs/privacy.md)
 
 ---
 

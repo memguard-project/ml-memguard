@@ -1,18 +1,14 @@
-"""Tests for PR 23: inference telemetry schema expansion.
+"""Tests for inference telemetry schema and KVCacheMonitor upload integration.
 
 Covers:
   - InferenceTelemetry default construction (all fields zero)
   - InferenceTelemetry.to_dict() includes all 14 keys + oom_occurred sentinel
-  - upload_inference_telemetry() posts to POST /v1/telemetry with correct payload
-  - upload_inference_telemetry() returns False when no API key configured
-  - upload_inference_telemetry() returns False on HTTP error (never raises)
-  - record_telemetry() backward compat: still works without inference fields
   - KVCacheMonitor._compute_velocity(): cold start returns 0.0
   - KVCacheMonitor._compute_velocity(): correct blocks/s when block_size_mb == 0
   - KVCacheMonitor._compute_velocity(): correct MB/s when block_size_mb > 0
   - KVCacheMonitor._compute_velocity(): negative delta (eviction) returns negative rate
   - KVCacheMonitor telemetry upload fires after telemetry_upload_interval
-  - KVCacheMonitor telemetry upload skips when no API key
+  - KVCacheMonitor telemetry upload silently skips when no backend installed
   - KVCacheMonitor extended_poll_fn dict merged into InferenceTelemetry
   - KVCacheMonitor extended_poll_fn exception does not crash the monitor loop
   - Worker missing-field defaulting: payload without inference fields is accepted
@@ -20,10 +16,8 @@ Covers:
 
 from __future__ import annotations
 
-import logging
 import time
-from typing import Any, Dict
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -82,97 +76,6 @@ class TestInferenceTelemetry:
         """oom_occurred must always be 0 — inference telemetry rows aren't crashes."""
         d = InferenceTelemetry().to_dict()
         assert d["oom_occurred"] == 0
-
-
-# ---------------------------------------------------------------------------
-# cloud.upload_inference_telemetry
-# ---------------------------------------------------------------------------
-
-class TestUploadInferenceTelemetry:
-    def _mock_httpx_post(self, status: int = 200):
-        resp = MagicMock()
-        resp.status_code = status
-        resp.raise_for_status = MagicMock()
-        if status >= 400:
-            resp.raise_for_status.side_effect = Exception(f"HTTP {status}")
-        httpx_mock = MagicMock()
-        httpx_mock.post.return_value = resp
-        return httpx_mock
-
-    def test_returns_false_no_api_key(self):
-        from memory_guard import cloud
-        with patch.dict("os.environ", {}, clear=True):
-            result = cloud.upload_inference_telemetry(InferenceTelemetry())
-        assert result is False
-
-    def test_returns_true_on_success(self):
-        from memory_guard import cloud
-        httpx_mock = self._mock_httpx_post(200)
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": httpx_mock}):
-                result = cloud.upload_inference_telemetry(InferenceTelemetry())
-        assert result is True
-
-    def test_posts_to_v1_telemetry(self):
-        from memory_guard import cloud
-        httpx_mock = self._mock_httpx_post(200)
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": httpx_mock}):
-                cloud.upload_inference_telemetry(InferenceTelemetry(kv_velocity_mbps=7.0))
-        call_args = httpx_mock.post.call_args
-        assert "/v1/telemetry" in call_args[0][0]
-
-    def test_payload_contains_inference_fields(self):
-        import json
-        from memory_guard import cloud
-        httpx_mock = self._mock_httpx_post(200)
-        signals = InferenceTelemetry(kv_velocity_mbps=4.5, eviction_rate=1.2)
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": httpx_mock}):
-                cloud.upload_inference_telemetry(signals)
-        body = json.loads(httpx_mock.post.call_args[1]["content"])
-        assert body["kv_velocity_mbps"] == 4.5
-        assert body["eviction_rate"] == 1.2
-        assert body["oom_occurred"] == 0
-
-    def test_returns_false_on_http_error(self):
-        from memory_guard import cloud
-        httpx_mock = self._mock_httpx_post(500)
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": httpx_mock}):
-                result = cloud.upload_inference_telemetry(InferenceTelemetry())
-        assert result is False
-
-    def test_never_raises(self):
-        """Even if httpx is not installed, the call must not propagate an exception."""
-        from memory_guard import cloud
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": None}):  # missing dependency
-                result = cloud.upload_inference_telemetry(InferenceTelemetry())
-        assert result is False
-
-
-# ---------------------------------------------------------------------------
-# record_telemetry backward compatibility
-# ---------------------------------------------------------------------------
-
-class TestRecordTelemetryBackwardCompat:
-    def test_old_call_signature_still_works(self):
-        """record_telemetry(run_data) must work unchanged — no inference fields needed."""
-        from memory_guard import cloud
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.raise_for_status = MagicMock()
-        httpx_mock = MagicMock()
-        httpx_mock.post.return_value = resp
-        run_data = {
-            "model_name": "llama", "backend": "cuda",
-            "batch_size": 4, "oom_occurred": False,
-        }
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": httpx_mock}):
-                result = cloud.record_telemetry(run_data)
-        assert result is True
 
 
 # ---------------------------------------------------------------------------
@@ -235,51 +138,20 @@ class TestComputeVelocity:
 # ---------------------------------------------------------------------------
 
 class TestKVCacheMonitorTelemetryUpload:
-    def _run_ticks(
-        self,
-        monitor: KVCacheMonitor,
-        ticks: int,
-        used: int = 50,
-        total: int = 100,
-    ) -> None:
-        """Drive the monitor loop manually for *ticks* iterations."""
-        for _ in range(ticks):
-            try:
-                u, t = monitor.poll_fn()
-            except Exception:
-                u, t = used, total
-            utilization = u / t if t > 0 else 0.0
-            now = time.time()
-            vel = monitor._compute_velocity(u, now)
-            with monitor._lock:
-                monitor._history.append(utilization)
-            if (now - monitor._last_telemetry_upload) >= monitor._telemetry_upload_interval:
-                monitor._upload_inference_telemetry(vel)
-                monitor._last_telemetry_upload = now
-
-    def test_upload_skips_without_api_key(self):
-        """No API key → upload_inference_telemetry returns False, monitor doesn't crash."""
-        uploaded: list = []
-
-        def fake_upload(signals):
-            uploaded.append(signals)
-            return True
-
+    def test_upload_skips_silently_when_no_backend(self):
+        """No fleet backend → _upload_inference_telemetry does not raise."""
         mon = KVCacheMonitor(
             poll_fn=lambda: (50, 100),
-            telemetry_upload_interval=0.0,  # upload every tick
+            telemetry_upload_interval=0.0,
         )
         mon._last_telemetry_upload = 0.0
-
-        with patch.dict("os.environ", {}, clear=True):
-            mon._upload_inference_telemetry(1.0)
-
-        assert len(uploaded) == 0  # api_key() returned None, no upload
+        # With no backend installed, backends.upload_inference_signals returns False
+        # The monitor must not crash or raise.
+        with patch("memory_guard.backends.upload_inference_signals", return_value=False):
+            mon._upload_inference_telemetry(1.0)  # must not raise
 
     def test_upload_fires_after_interval(self):
-        """upload_inference_telemetry is called when the interval elapses."""
-        from memory_guard import cloud as _cloud
-
+        """upload_inference_signals is called when the interval elapses."""
         calls: list = []
 
         def fake_upload(signals):
@@ -292,17 +164,14 @@ class TestKVCacheMonitorTelemetryUpload:
         )
         mon._last_telemetry_upload = 0.0
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.object(_cloud, "upload_inference_telemetry", side_effect=fake_upload):
-                mon._upload_inference_telemetry(2.5)
+        with patch("memory_guard.backends.upload_inference_signals", side_effect=fake_upload):
+            mon._upload_inference_telemetry(2.5)
 
         assert len(calls) == 1
         assert calls[0].kv_velocity_mbps == 2.5
 
     def test_extended_poll_fn_merged(self):
         """Fields from extended_poll_fn appear in the uploaded InferenceTelemetry."""
-        from memory_guard import cloud as _cloud
-
         captured: list = []
 
         def extended():
@@ -314,10 +183,9 @@ class TestKVCacheMonitorTelemetryUpload:
             telemetry_upload_interval=0.0,
         )
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.object(_cloud, "upload_inference_telemetry",
-                              side_effect=lambda s: captured.append(s) or True):
-                mon._upload_inference_telemetry(0.5)
+        with patch("memory_guard.backends.upload_inference_signals",
+                   side_effect=lambda s: captured.append(s) or True):
+            mon._upload_inference_telemetry(0.5)
 
         assert len(captured) == 1
         assert captured[0].eviction_rate == pytest.approx(3.7)
@@ -326,8 +194,6 @@ class TestKVCacheMonitorTelemetryUpload:
 
     def test_extended_poll_fn_exception_does_not_crash(self):
         """A crashing extended_poll_fn must not propagate to the monitor."""
-        from memory_guard import cloud as _cloud
-
         def broken():
             raise RuntimeError("GPU driver exploded")
 
@@ -337,15 +203,12 @@ class TestKVCacheMonitorTelemetryUpload:
             telemetry_upload_interval=0.0,
         )
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.object(_cloud, "upload_inference_telemetry", return_value=True):
-                # Must not raise
-                mon._upload_inference_telemetry(0.0)
+        with patch("memory_guard.backends.upload_inference_signals", return_value=True):
+            # Must not raise
+            mon._upload_inference_telemetry(0.0)
 
     def test_context_fields_propagated(self):
         """model_name/backend/os_platform from constructor appear in upload."""
-        from memory_guard import cloud as _cloud
-
         captured: list = []
         mon = KVCacheMonitor(
             poll_fn=lambda: (50, 100),
@@ -355,10 +218,9 @@ class TestKVCacheMonitorTelemetryUpload:
             telemetry_os_platform="linux",
         )
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.object(_cloud, "upload_inference_telemetry",
-                              side_effect=lambda s: captured.append(s) or True):
-                mon._upload_inference_telemetry(1.0)
+        with patch("memory_guard.backends.upload_inference_signals",
+                   side_effect=lambda s: captured.append(s) or True):
+            mon._upload_inference_telemetry(1.0)
 
         assert captured[0].model_name == "meta-llama/Llama-3-8B"
         assert captured[0].backend == "cuda"
@@ -371,7 +233,7 @@ class TestKVCacheMonitorTelemetryUpload:
 
 class TestWorkerMissingFieldDefaulting:
     """Verify the Python client sends 0.0 for missing inference fields so
-    the Worker stores them as 0 (backward-compatible with old callers)."""
+    the fleet backend stores them as 0 (backward-compatible with old callers)."""
 
     def test_default_telemetry_has_zero_inference_fields(self):
         """An InferenceTelemetry() with all defaults produces a payload where

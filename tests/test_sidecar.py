@@ -173,18 +173,16 @@ class TestLastOomProbability:
             "confidence": 0.9,
             "model_source": "ml",
         }
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "mg_testkey123"}):
-            with patch("memory_guard.cloud.predict_oom", return_value=result):
-                mon._run_predict_oom(kv_velocity=2.0, utilization=0.85, shed_ready=True)
+        with patch("memory_guard.backends.predict_oom", return_value=result):
+            mon._run_predict_oom(kv_velocity=2.0, utilization=0.85, shed_ready=True)
         assert mon.last_oom_probability == pytest.approx(0.77)
 
     def test_unchanged_when_predict_oom_returns_none(self):
         mon = _make_monitor()
         mon._last_oom_probability = 0.5
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "mg_testkey123"}):
-            with patch("memory_guard.cloud.predict_oom", return_value=None):
-                mon._run_predict_oom(kv_velocity=1.0, utilization=0.5, shed_ready=False)
-        # Should not change when cloud returns None
+        with patch("memory_guard.backends.predict_oom", return_value=None):
+            mon._run_predict_oom(kv_velocity=1.0, utilization=0.5, shed_ready=False)
+        # Should not change when backend returns None
         assert mon.last_oom_probability == pytest.approx(0.5)
 
 

@@ -425,9 +425,7 @@ class KVCacheMonitor:
           p ≤ 0.70 → no action (let reactive thresholds decide)
         """
         try:
-            from . import cloud as _cloud
-            if not _cloud.api_key():
-                return
+            from .backends import predict_oom as _predict_oom
 
             extra: Dict[str, Any] = {}
             if self._extended_poll_fn is not None:
@@ -447,10 +445,10 @@ class KVCacheMonitor:
                 "kvcache_mb":          float(extra.get("kvcache_mb", 0.0)),
             }
 
-            result = _cloud.predict_oom(
+            result = _predict_oom(
                 signals,
                 model_name=self._telemetry_model_name,
-                backend=self._telemetry_backend,
+                backend_str=self._telemetry_backend,
             )
 
             if result is None:
@@ -516,9 +514,7 @@ class KVCacheMonitor:
         Silently skips when no API key is configured or any step fails.
         """
         try:
-            from . import cloud as _cloud
-            if not _cloud.api_key():
-                return
+            from .backends import upload_inference_signals as _upload_signals
             from .telemetry import InferenceTelemetry
 
             extra: Dict[str, Any] = {}
@@ -543,7 +539,7 @@ class KVCacheMonitor:
                 backend             = self._telemetry_backend,
                 os_platform         = self._telemetry_os_platform,
             )
-            _cloud.upload_inference_telemetry(signals)
+            _upload_signals(signals)
         except Exception as exc:
             logger.debug("KVCacheMonitor telemetry upload raised: %s", exc)
 

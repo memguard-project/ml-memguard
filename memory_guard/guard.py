@@ -720,12 +720,12 @@ class MemoryGuard:
                 self._policy.num_updates,
             )
 
-        # Cloud telemetry — fire-and-forget, never raises
+        # Fleet telemetry — fire-and-forget, never raises
         try:
-            from .cloud import record_telemetry
+            from .backends import record_training_result as _record_training
             _sk = self._last_state_key
             _act = self._last_action
-            record_telemetry({
+            _record_training({
                 "model_name":    model_name,
                 "backend":       self.platform.backend.value,
                 "os_platform":   self.platform.os_platform,

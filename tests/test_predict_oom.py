@@ -1,14 +1,6 @@
-"""Tests for PR 24: POST /v1/predict — predictive OOM endpoint.
+"""Tests for predictive OOM logic.
 
 Covers:
-  - predict_oom() returns None when no API key configured
-  - predict_oom() returns None on timeout (httpx.TimeoutException)
-  - predict_oom() returns None on HTTP error (never raises)
-  - predict_oom() returns None when httpx is unavailable (never raises)
-  - predict_oom() returns dict on success with expected keys
-  - predict_oom() uses 50 ms timeout (timeout=0.05 in httpx.post call)
-  - predict_oom() includes model_name and backend in payload
-  - predict_oom() merges caller signals dict into payload
   - Worker scoring: safe conditions → oom_probability < 0.5
   - Worker scoring: dangerous conditions → oom_probability > 0.7
   - Worker scoring: critical conditions → oom_probability > 0.92
@@ -22,14 +14,13 @@ Covers:
   - KVCacheMonitor: no action when predict_oom returns None (fallback)
   - KVCacheMonitor: no double shed_load within cooldown
   - KVCacheMonitor: predictive restart respects 120 s cooldown
-  - KVCacheMonitor: predict skipped when no API key
 """
 
 from __future__ import annotations
 
 import math
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -91,120 +82,6 @@ def _horizon(p: float) -> int:
     if p > 0.70: return 60
     if p > 0.50: return 120
     return 300
-
-
-# ---------------------------------------------------------------------------
-# predict_oom — cloud.py
-# ---------------------------------------------------------------------------
-
-class TestPredictOom:
-    def _mock_httpx_post(self, payload: dict, status: int = 200):
-        resp = MagicMock()
-        resp.status_code = status
-        resp.json.return_value = payload
-        if status >= 400:
-            resp.raise_for_status.side_effect = Exception(f"HTTP {status}")
-        else:
-            resp.raise_for_status = MagicMock()
-        httpx_mock = MagicMock()
-        httpx_mock.post.return_value = resp
-        return httpx_mock
-
-    def test_returns_none_no_api_key(self):
-        from memory_guard import cloud
-        with patch.dict("os.environ", {}, clear=True):
-            assert cloud.predict_oom({}) is None
-
-    def test_returns_none_on_timeout(self):
-        from memory_guard import cloud
-        import httpx as _httpx  # real module for the exception type
-
-        class FakeHttpx:
-            TimeoutException = _httpx.TimeoutException
-
-            @staticmethod
-            def post(*a, **kw):
-                raise _httpx.TimeoutException("timeout")
-
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": FakeHttpx}):
-                result = cloud.predict_oom({})
-        assert result is None
-
-    def test_returns_none_on_http_error(self):
-        from memory_guard import cloud
-        httpx_mock = self._mock_httpx_post({}, status=503)
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": httpx_mock}):
-                result = cloud.predict_oom({})
-        assert result is None
-
-    def test_never_raises(self):
-        from memory_guard import cloud
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": None}):
-                result = cloud.predict_oom({})
-        assert result is None
-
-    def test_returns_dict_on_success(self):
-        from memory_guard import cloud
-        payload = {
-            "oom_probability": 0.85,
-            "action": "shed_load",
-            "horizon_seconds": 60,
-            "confidence": 0.6,
-        }
-        httpx_mock = self._mock_httpx_post(payload, status=200)
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": httpx_mock}):
-                result = cloud.predict_oom({"kv_velocity_mbps": 3.0})
-        assert result is not None
-        assert result["oom_probability"] == pytest.approx(0.85)
-        assert result["action"] == "shed_load"
-        assert result["horizon_seconds"] == 60
-
-    def test_50ms_timeout_enforced(self):
-        """httpx.post must be called with timeout=0.05."""
-        from memory_guard import cloud
-        httpx_mock = self._mock_httpx_post(
-            {"oom_probability": 0.1, "action": "none", "horizon_seconds": 300, "confidence": 0.3}
-        )
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": httpx_mock}):
-                cloud.predict_oom({})
-        _, kwargs = httpx_mock.post.call_args
-        assert kwargs.get("timeout") == pytest.approx(0.05)
-
-    def test_payload_includes_model_and_backend(self):
-        import json
-        from memory_guard import cloud
-        httpx_mock = self._mock_httpx_post(
-            {"oom_probability": 0.1, "action": "none", "horizon_seconds": 300, "confidence": 0.3}
-        )
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": httpx_mock}):
-                cloud.predict_oom(
-                    {"kv_velocity_mbps": 1.0},
-                    model_name="llama",
-                    backend="cuda",
-                )
-        body = json.loads(httpx_mock.post.call_args[1]["content"])
-        assert body["model_name"] == "llama"
-        assert body["backend"] == "cuda"
-
-    def test_payload_merges_signals_dict(self):
-        import json
-        from memory_guard import cloud
-        httpx_mock = self._mock_httpx_post(
-            {"oom_probability": 0.1, "action": "none", "horizon_seconds": 300, "confidence": 0.3}
-        )
-        signals = {"kv_velocity_mbps": 4.2, "eviction_rate": 3.0}
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            with patch.dict("sys.modules", {"httpx": httpx_mock}):
-                cloud.predict_oom(signals)
-        body = json.loads(httpx_mock.post.call_args[1]["content"])
-        assert body["kv_velocity_mbps"] == pytest.approx(4.2)
-        assert body["eviction_rate"] == pytest.approx(3.0)
 
 
 # ---------------------------------------------------------------------------
@@ -306,12 +183,10 @@ class TestKVCacheMonitorPredictIntegration:
         shed_calls: list = []
         mon = _make_monitor(on_shed_load=lambda u: shed_calls.append(u))
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            from memory_guard import cloud as _cloud
-            with patch.object(_cloud, "predict_oom",
-                              return_value=_make_prediction(0.80)):
-                mon._run_predict_oom(kv_velocity=2.0, utilization=0.75,
-                                     shed_ready=True)
+        with patch("memory_guard.backends.predict_oom",
+                   return_value=_make_prediction(0.80)):
+            mon._run_predict_oom(kv_velocity=2.0, utilization=0.75,
+                                 shed_ready=True)
 
         assert len(shed_calls) == 1
 
@@ -319,12 +194,10 @@ class TestKVCacheMonitorPredictIntegration:
         restart_calls: list = []
         mon = _make_monitor(restart_callback=lambda: restart_calls.append(1))
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            from memory_guard import cloud as _cloud
-            with patch.object(_cloud, "predict_oom",
-                              return_value=_make_prediction(0.95)):
-                mon._run_predict_oom(kv_velocity=6.0, utilization=0.88,
-                                     shed_ready=True)
+        with patch("memory_guard.backends.predict_oom",
+                   return_value=_make_prediction(0.95)):
+            mon._run_predict_oom(kv_velocity=6.0, utilization=0.88,
+                                 shed_ready=True)
 
         assert len(restart_calls) == 1
 
@@ -336,12 +209,10 @@ class TestKVCacheMonitorPredictIntegration:
             restart_callback=lambda: restart_calls.append(1),
         )
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            from memory_guard import cloud as _cloud
-            with patch.object(_cloud, "predict_oom",
-                              return_value=_make_prediction(0.45)):
-                mon._run_predict_oom(kv_velocity=0.5, utilization=0.50,
-                                     shed_ready=True)
+        with patch("memory_guard.backends.predict_oom",
+                   return_value=_make_prediction(0.45)):
+            mon._run_predict_oom(kv_velocity=0.5, utilization=0.50,
+                                 shed_ready=True)
 
         assert shed_calls == []
         assert restart_calls == []
@@ -351,11 +222,9 @@ class TestKVCacheMonitorPredictIntegration:
         shed_calls: list = []
         mon = _make_monitor(on_shed_load=lambda u: shed_calls.append(u))
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            from memory_guard import cloud as _cloud
-            with patch.object(_cloud, "predict_oom", return_value=None):
-                mon._run_predict_oom(kv_velocity=5.0, utilization=0.88,
-                                     shed_ready=True)
+        with patch("memory_guard.backends.predict_oom", return_value=None):
+            mon._run_predict_oom(kv_velocity=5.0, utilization=0.88,
+                                 shed_ready=True)
 
         assert shed_calls == []  # predictive path did nothing; reactive still handles it
 
@@ -364,13 +233,11 @@ class TestKVCacheMonitorPredictIntegration:
         shed_calls: list = []
         mon = _make_monitor(on_shed_load=lambda u: shed_calls.append(u))
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            from memory_guard import cloud as _cloud
-            with patch.object(_cloud, "predict_oom",
-                              return_value=_make_prediction(0.80)):
-                # shed_ready=False means cooldown hasn't elapsed
-                mon._run_predict_oom(kv_velocity=2.0, utilization=0.75,
-                                     shed_ready=False)
+        with patch("memory_guard.backends.predict_oom",
+                   return_value=_make_prediction(0.80)):
+            # shed_ready=False means cooldown hasn't elapsed
+            mon._run_predict_oom(kv_velocity=2.0, utilization=0.75,
+                                 shed_ready=False)
 
         assert shed_calls == []
 
@@ -381,28 +248,12 @@ class TestKVCacheMonitorPredictIntegration:
         # Simulate a restart that happened 5 seconds ago (within cooldown)
         mon._last_predictive_restart = time.time() - 5.0
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            from memory_guard import cloud as _cloud
-            with patch.object(_cloud, "predict_oom",
-                              return_value=_make_prediction(0.97)):
-                mon._run_predict_oom(kv_velocity=9.0, utilization=0.95,
-                                     shed_ready=True)
+        with patch("memory_guard.backends.predict_oom",
+                   return_value=_make_prediction(0.97)):
+            mon._run_predict_oom(kv_velocity=9.0, utilization=0.95,
+                                 shed_ready=True)
 
         assert restart_calls == []  # cooldown blocked second restart
-
-    def test_predict_skipped_when_no_api_key(self):
-        """No API key → predict_oom never called."""
-        shed_calls: list = []
-        mon = _make_monitor(on_shed_load=lambda u: shed_calls.append(u))
-
-        with patch.dict("os.environ", {}, clear=True):
-            from memory_guard import cloud as _cloud
-            with patch.object(_cloud, "predict_oom") as mock_predict:
-                mon._run_predict_oom(kv_velocity=5.0, utilization=0.88,
-                                     shed_ready=True)
-                mock_predict.assert_not_called()
-
-        assert shed_calls == []
 
     def test_extended_poll_fn_signals_sent_to_predict(self):
         """extended_poll_fn dict is merged into the predict_oom signals payload."""
@@ -416,11 +267,9 @@ class TestKVCacheMonitorPredictIntegration:
             extended_poll_fn=lambda: {"eviction_rate": 5.5, "fragmentation_ratio": 0.7}
         )
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            from memory_guard import cloud as _cloud
-            with patch.object(_cloud, "predict_oom", side_effect=fake_predict):
-                mon._run_predict_oom(kv_velocity=3.0, utilization=0.70,
-                                     shed_ready=True)
+        with patch("memory_guard.backends.predict_oom", side_effect=fake_predict):
+            mon._run_predict_oom(kv_velocity=3.0, utilization=0.70,
+                                 shed_ready=True)
 
         assert captured_signals[0]["eviction_rate"] == pytest.approx(5.5)
         assert captured_signals[0]["fragmentation_ratio"] == pytest.approx(0.7)
@@ -429,10 +278,8 @@ class TestKVCacheMonitorPredictIntegration:
         """Any exception in _run_predict_oom must be swallowed."""
         mon = _make_monitor()
 
-        with patch.dict("os.environ", {"MEMGUARD_BACKEND_KEY": "test-key-abcdefgh"}):
-            from memory_guard import cloud as _cloud
-            with patch.object(_cloud, "predict_oom",
-                              side_effect=RuntimeError("network exploded")):
-                # Must not raise
-                mon._run_predict_oom(kv_velocity=3.0, utilization=0.70,
-                                     shed_ready=True)
+        with patch("memory_guard.backends.predict_oom",
+                   side_effect=RuntimeError("network exploded")):
+            # Must not raise
+            mon._run_predict_oom(kv_velocity=3.0, utilization=0.70,
+                                 shed_ready=True)

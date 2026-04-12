@@ -41,15 +41,13 @@ hf = ["transformers>=4.30", "torch>=2.0", "accelerate>=1.1.0"]
 unsloth = ["unsloth", "transformers>=4.30", "torch>=2.0", "accelerate>=1.1.0"]
 vllm = ["vllm>=0.4"]
 sglang = ["sglang>=0.3"]
-cloud = ["httpx>=0.24"]
-sidecar = ["httpx>=0.24"]   # stdlib HTTP server; cloud dep for OOM predictions
+sidecar = ["httpx>=0.24"]   # stdlib HTTP server
 ebpf = ["bcc"]              # Linux eBPF cgroup memory + preemption probes (requires libbcc-dev)
-all = ["torch>=2.0", "mlx>=0.10", "psutil>=5.9", "transformers>=4.30", "vllm>=0.4", "sglang>=0.3", "httpx>=0.24"]
+all = ["torch>=2.0", "mlx>=0.10", "psutil>=5.9", "transformers>=4.30", "vllm>=0.4", "sglang>=0.3"]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "mypy>=1.0", "ruff>=0.1"]
 
 [project.scripts]
-memguard-sidecar           = "memory_guard.sidecar:main"
-memguard-explain-telemetry = "memory_guard.telemetry_explain:main"
+memguard-sidecar = "memory_guard.sidecar:main"
 
 [project.urls]
 Homepage = "https://github.com/memguard-project/ml-memguard"

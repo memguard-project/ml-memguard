@@ -1,9 +1,9 @@
-"""Telemetry data structures for inference-signal upload to ml-memguard.
+"""Telemetry data structures for inference-signal collection.
 
 ``InferenceTelemetry`` captures the seven signals that are invisible to
 vLLM/SGLang's own Prometheus endpoints but are critical for predicting OOM
 events before they happen.  The ``KVCacheMonitor`` populates these on every
-monitoring cycle and hands them to ``cloud.upload_inference_telemetry``.
+monitoring cycle and passes them to the active fleet backend (if any).
 
 Signals
 -------
@@ -52,11 +52,10 @@ from dataclasses import dataclass, field
 
 @dataclass
 class InferenceTelemetry:
-    """Full payload sent to ``POST /v1/telemetry`` for an inference monitoring cycle.
+    """Inference monitoring signals collected during one poll cycle.
 
-    All numeric fields default to ``0.0`` / ``0`` so partial uploads are safe
-    — the cloud stores whatever the client supplies and treats zero as
-    "not measured" rather than "zero pressure".
+    All numeric fields default to ``0.0`` / ``0`` so partial records are safe
+    — the fleet backend treats zero as "not measured" rather than "zero pressure".
 
     Attributes
     ----------
