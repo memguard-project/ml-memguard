@@ -194,6 +194,8 @@ class KVCacheMonitor:
         self._last_warning_time: float = 0.0
         self._last_shed_load_time: float = 0.0
         self._critical_consecutive: int = 0
+        # PR 31: last cloud-predicted OOM probability (0.0 = no prediction yet)
+        self._last_oom_probability: float = 0.0
 
     # ------------------------------------------------------------------
     # Public properties
@@ -219,6 +221,16 @@ class KVCacheMonitor:
         """True while the background thread is alive."""
         return self._thread is not None and self._thread.is_alive()
 
+    @property
+    def last_oom_probability(self) -> float:
+        """Most recent OOM probability returned by the cloud predict API.
+
+        Returns 0.0 until the first successful ``POST /v1/predict`` call.
+        Read by the sidecar ``/readyz`` endpoint to drive Kubernetes
+        readiness-gate load-shedding (PR 31).
+        """
+        return self._last_oom_probability
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -240,6 +252,7 @@ class KVCacheMonitor:
         self._prev_poll_time = 0.0
         self._last_telemetry_upload = 0.0
         self._last_predictive_restart = 0.0
+        self._last_oom_probability = 0.0
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="kv-cache-monitor"
@@ -395,6 +408,9 @@ class KVCacheMonitor:
             p            = float(result.get("oom_probability", 0.0))
             horizon      = result.get("horizon_seconds", "?")
             model_source = result.get("model_source", "unknown")
+
+            # PR 31: expose for sidecar /readyz probe
+            self._last_oom_probability = p
 
             logger.debug(
                 "[memory-guard] predict_oom: p=%.3f source=%s horizon=%s",
