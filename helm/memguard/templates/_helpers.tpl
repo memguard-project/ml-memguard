@@ -60,6 +60,18 @@ Service account name
 {{- end }}
 
 {{/*
+Target namespace for the existing-deployment patch job.
+Defaults to .Release.Namespace when patchExistingDeployment.targetNamespace is empty.
+*/}}
+{{- define "memguard.patchTargetNamespace" -}}
+{{- if .Values.patchExistingDeployment.targetNamespace }}
+{{- .Values.patchExistingDeployment.targetNamespace }}
+{{- else }}
+{{- .Release.Namespace }}
+{{- end }}
+{{- end }}
+
+{{/*
 memguard-cloud secret name — prefers existingSecret, falls back to generated.
 */}}
 {{- define "memguard.cloudSecretName" -}}

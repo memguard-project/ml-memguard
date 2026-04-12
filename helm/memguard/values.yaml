@@ -157,6 +157,66 @@ serviceAccount:
   name: ""
 
 # ---------------------------------------------------------------------------
+# PodDisruptionBudget
+# Ensures rolling restarts never take all replicas down simultaneously.
+# minAvailable: 1 means at least one pod stays in service during node drains.
+# ---------------------------------------------------------------------------
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# ---------------------------------------------------------------------------
+# Autoscaling — KEDA ScaledObject (requires KEDA installed in the cluster)
+#
+# When enabled, creates a ScaledObject that scales the vLLM Deployment on
+# the vllm_kv_cache_usage_perc Prometheus metric exposed by the sidecar.
+# Scale-up at threshold% utilization; scale-down during cooldownPeriod.
+#
+# Check KEDA is installed: kubectl get crd scaledobjects.keda.sh
+# ---------------------------------------------------------------------------
+autoscaling:
+  keda:
+    enabled: false
+    minReplicaCount: 1
+    maxReplicaCount: 10
+    # Seconds between metric polls
+    pollingInterval: 30
+    # Seconds to wait after last scale event before scaling down
+    cooldownPeriod: 300
+    # Prometheus server reachable from within the cluster
+    prometheusAddress: "http://prometheus-server.monitoring.svc.cluster.local"
+    # PromQL query — returns a scalar utilization value (0–100)
+    prometheusQuery: "avg(vllm_kv_cache_usage_perc)"
+    # Scale up when average KV cache utilization exceeds this percentage
+    scaleUpThreshold: "65"
+
+# ---------------------------------------------------------------------------
+# Patch existing vLLM Deployment (bring-your-own-vLLM scenario)
+#
+# When enabled, a post-install Helm hook Job runs `kubectl patch` to inject
+# the memguard /readyz readinessProbe into an existing vLLM Deployment that
+# was NOT deployed via this chart.
+#
+# Requires the chart's ServiceAccount to have patch rights on the target
+# Deployment — a ClusterRole is created automatically when this is enabled.
+#
+# Usage:
+#   helm install memguard-probe memguard/memguard \
+#     --set patchExistingDeployment.enabled=true \
+#     --set patchExistingDeployment.targetDeployment=my-vllm \
+#     --set patchExistingDeployment.targetNamespace=inference \
+#     --set vllm.modelName=placeholder   # required field, value unused here
+# ---------------------------------------------------------------------------
+patchExistingDeployment:
+  enabled: false
+  # Name of the existing vLLM Deployment to patch
+  targetDeployment: ""
+  # Namespace of the target Deployment (defaults to .Release.Namespace)
+  targetNamespace: ""
+  # Name of the vLLM container inside the Deployment
+  containerName: "vllm"
+
+# ---------------------------------------------------------------------------
 # Optional: memguard-cloud API key
 # Populate via: helm install ... --set memguardCloud.apiKey=mg_...
 # or by referencing an existing Secret (set existingSecret).

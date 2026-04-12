@@ -1,0 +1,74 @@
+{{- if .Values.autoscaling.keda.enabled }}
+# ---------------------------------------------------------------------------
+# KEDA ScaledObject — scales the vLLM Deployment on KV cache utilization.
+#
+# How it works:
+#   KEDA polls the Prometheus query every pollingInterval seconds.
+#   When the average vllm_kv_cache_usage_perc exceeds scaleUpThreshold,
+#   KEDA adds replicas (up to maxReplicaCount) to distribute the load.
+#   After cooldownPeriod seconds of low utilization, KEDA scales back down.
+#
+# Prerequisite:
+#   KEDA must be installed in the cluster.
+#   kubectl get crd scaledobjects.keda.sh
+#   If the CRD is absent, set autoscaling.keda.enabled=false (default).
+#
+# Interaction with memguard /readyz:
+#   KEDA scaling and memguard load-shedding are complementary:
+#     - memguard /readyz fires first (removes pod from Service endpoints
+#       when KV cache is near capacity on a single pod).
+#     - KEDA fires next (adds replicas when cluster-wide utilization is high).
+#   Together they cover two failure modes: single-pod KV exhaustion (memguard)
+#   and sustained fleet-wide capacity shortage (KEDA).
+#
+# Tuning guidance:
+#   scaleUpThreshold should be set BELOW sidecar.shedThreshold × 100.
+#   Example: shedThreshold=0.70 → scaleUpThreshold="65"
+#   This starts adding capacity before individual pods start shedding load.
+# ---------------------------------------------------------------------------
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "memguard.fullname" . }}-keda
+  labels:
+    {{- include "memguard.labels" . | nindent 4 }}
+  annotations:
+    # KEDA reads this label to find the ScaledObject's target Deployment.
+    scaledobject.keda.sh/transfer-hpa-ownership: "true"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "memguard.fullname" . }}
+  minReplicaCount: {{ .Values.autoscaling.keda.minReplicaCount }}
+  maxReplicaCount: {{ .Values.autoscaling.keda.maxReplicaCount }}
+  pollingInterval: {{ .Values.autoscaling.keda.pollingInterval }}
+  cooldownPeriod:  {{ .Values.autoscaling.keda.cooldownPeriod }}
+  # Prevent scale-down while any pod's /readyz is returning 503.
+  # This avoids removing a pod that is already under KV cache pressure.
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.autoscaling.keda.cooldownPeriod }}
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 30
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.autoscaling.keda.prometheusAddress | quote }}
+        metricName: vllm_kv_cache_usage_perc
+        threshold:   {{ .Values.autoscaling.keda.scaleUpThreshold | quote }}
+        query:       {{ .Values.autoscaling.keda.prometheusQuery | quote }}
+        # Namespace scope for the Prometheus query
+        namespace:   {{ .Release.Namespace | quote }}
+{{- end }}

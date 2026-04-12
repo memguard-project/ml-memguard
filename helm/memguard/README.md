@@ -43,6 +43,31 @@ kubectl port-forward deployment/my-vllm 8000:8000 8001:8001 -n inference
 curl -i http://localhost:8001/readyz
 ```
 
+## How Kubernetes control-plane load-shedding works
+
+This is the exact sequence of events when the KV cache exceeds the OOM threshold:
+
+```
+1. memguard sidecar polls vLLM /metrics every pollInterval seconds
+2. KVCacheMonitor computes oom_probability from KV utilization, velocity,
+   fragmentation ratio, and eviction rate
+3. oom_probability > shedThreshold → /readyz returns HTTP 503
+4. kubelet detects 503 on failureThreshold: 1 — pod marked NotReady immediately
+5. kube-proxy updates iptables/ipvs rules on all nodes within ~1 second —
+   pod IP removed from Service Endpoints slice
+6. Ingress controller / Gateway API / cloud LB stops routing new connections
+   to this pod on its next health-check cycle (typically < 5 s)
+7. In-flight vLLM requests continue — pod is NOT killed, sequences drain cleanly
+8. VLLMWatchdog schedules a graceful restart during the quiet drain window
+9. After restart: /readyz returns 200 → pod re-enters the Endpoints slice →
+   traffic resumes automatically — no manual intervention required
+```
+
+**Key property**: `failureThreshold: 1` means a single 503 pulls the pod.
+This is intentional — by the time the KV cache hits the threshold there is
+no margin for another request to land. The sidecar's threshold should be set
+conservatively (default 0.70) to provide that margin.
+
 ## Values reference
 
 | Key | Default | Description |
@@ -60,6 +85,18 @@ curl -i http://localhost:8001/readyz
 | `sidecar.backend` | `""` | Backend string attached to telemetry |
 | `sidecar.resources` | 256Mi RAM, 100m CPU | Sidecar resource requests/limits |
 | `replicaCount` | `1` | Number of pod replicas |
+| `podDisruptionBudget.enabled` | `true` | Create PodDisruptionBudget |
+| `podDisruptionBudget.minAvailable` | `1` | Minimum pods available during disruptions |
+| `autoscaling.keda.enabled` | `false` | Enable KEDA ScaledObject (requires KEDA CRD) |
+| `autoscaling.keda.minReplicaCount` | `1` | Minimum replicas |
+| `autoscaling.keda.maxReplicaCount` | `10` | Maximum replicas |
+| `autoscaling.keda.scaleUpThreshold` | `"65"` | KV cache % to trigger scale-up |
+| `autoscaling.keda.prometheusAddress` | see values.yaml | Prometheus server URL |
+| `autoscaling.keda.prometheusQuery` | `avg(vllm_kv_cache_usage_perc)` | PromQL query |
+| `patchExistingDeployment.enabled` | `false` | Patch a bring-your-own-vLLM Deployment |
+| `patchExistingDeployment.targetDeployment` | `""` | Name of Deployment to patch |
+| `patchExistingDeployment.targetNamespace` | `""` | Namespace (defaults to Release namespace) |
+| `patchExistingDeployment.containerName` | `"vllm"` | Container name inside the Deployment |
 | `nodeSelector` | `{}` | Pin pods to GPU nodes |
 | `tolerations` | `[]` | Tolerations for GPU taints |
 | `memguardCloud.apiKey` | `""` | API key for fleet telemetry (optional) |
@@ -95,6 +132,87 @@ readinessProbe:
 `failureThreshold: 1` means a single 503 from `/readyz` removes the pod
 from the endpoint set. This is intentional — by the time the KV cache
 hits the threshold, there is no margin for another 503-causing request.
+
+## PodDisruptionBudget
+
+Enabled by default (`podDisruptionBudget.enabled=true`, `minAvailable=1`).
+Prevents node drains from evicting all replicas simultaneously. For a
+single-replica deployment this blocks the drain until the replacement pod
+passes `/readyz` — eliminating the 0-replica traffic window.
+
+Disable only if you manage disruption budgets externally:
+
+```bash
+helm upgrade my-vllm memguard/memguard \
+  --set podDisruptionBudget.enabled=false \
+  --reuse-values
+```
+
+## KEDA autoscaling (optional)
+
+Requires [KEDA](https://keda.sh) installed in the cluster:
+
+```bash
+# Check KEDA is present
+kubectl get crd scaledobjects.keda.sh
+```
+
+Enable with a Prometheus address pointing to your monitoring stack:
+
+```bash
+helm upgrade my-vllm memguard/memguard \
+  --set autoscaling.keda.enabled=true \
+  --set autoscaling.keda.prometheusAddress=http://kube-prometheus-stack-prometheus.monitoring.svc:9090 \
+  --set autoscaling.keda.scaleUpThreshold=65 \
+  --set autoscaling.keda.maxReplicaCount=8 \
+  --reuse-values
+```
+
+**Tuning rule**: set `scaleUpThreshold` below `sidecar.shedThreshold × 100`
+so KEDA starts adding replicas *before* individual pods start shedding load:
+
+```
+sidecar.shedThreshold=0.70  →  autoscaling.keda.scaleUpThreshold="65"
+sidecar.shedThreshold=0.85  →  autoscaling.keda.scaleUpThreshold="80"
+```
+
+## Bring your own vLLM Deployment
+
+If vLLM is already running in your cluster (deployed via a different chart
+or manifest), inject the memguard readiness gate without redeploying:
+
+```bash
+# 1. Deploy only the sidecar Deployment + Service
+helm install memguard-probe memguard/memguard \
+  --set vllm.modelName=meta-llama/Llama-3.1-8B-Instruct \
+  --set patchExistingDeployment.enabled=true \
+  --set patchExistingDeployment.targetDeployment=my-existing-vllm \
+  --set patchExistingDeployment.targetNamespace=inference \
+  --namespace inference
+```
+
+A Helm post-install Job runs `kubectl strategic-merge-patch` to inject:
+
+```json
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [{
+          "name": "vllm",
+          "readinessProbe": {
+            "httpGet": { "path": "/readyz", "port": 8001 },
+            "failureThreshold": 1,
+            "periodSeconds": 10
+          }
+        }]
+      }
+    }
+  }
+}
+```
+
+The patch is idempotent — safe to re-run on `helm upgrade`.
 
 ## memguard-cloud (optional fleet intelligence)
 

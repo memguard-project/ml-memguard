@@ -1,0 +1,24 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# ---------------------------------------------------------------------------
+# PodDisruptionBudget — ensures at least minAvailable replicas stay running
+# during voluntary disruptions (node drains, rolling upgrades, etc.).
+#
+# Why this matters for LLM inference:
+#   A node drain without a PDB can evict all pods simultaneously, taking the
+#   entire inference service down.  minAvailable: 1 guarantees at least one
+#   replica is always serving while others restart.  For single-replica
+#   deployments this blocks the drain until the new pod is Ready (i.e., until
+#   the memguard /readyz probe returns 200) — preventing a 0-replica window.
+# ---------------------------------------------------------------------------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "memguard.fullname" . }}-pdb
+  labels:
+    {{- include "memguard.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "memguard.selectorLabels" . | nindent 6 }}
+{{- end }}
