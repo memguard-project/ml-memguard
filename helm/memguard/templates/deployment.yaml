@@ -96,12 +96,26 @@ spec:
         - name: memguard-sidecar
           image: "{{ .Values.sidecar.image.repository }}:{{ .Values.sidecar.image.tag }}"
           imagePullPolicy: {{ .Values.sidecar.image.pullPolicy }}
+          {{- if .Values.ebpf.enabled }}
+          # CAP_BPF + CAP_PERFMON allow the sidecar to load and attach BPF
+          # programs.  Only granted when ebpf.enabled: true is explicitly set.
+          # See docs/ebpf/ebpf-kubernetes.md for the security audit trail.
+          securityContext:
+            capabilities:
+              add:
+                - CAP_BPF
+                - CAP_PERFMON
+          {{- end }}
           command:
             - sh
             - -c
             - |
               set -e
+              {{- if .Values.ebpf.enabled }}
+              pip install 'ml-memguard[ebpf]' --quiet --no-cache-dir
+              {{- else }}
               pip install ml-memguard --quiet --no-cache-dir
+              {{- end }}
               exec python -m memory_guard.sidecar \
                 --vllm-url      http://localhost:{{ .Values.vllm.port }} \
                 --host          0.0.0.0 \

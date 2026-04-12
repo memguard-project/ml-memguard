@@ -239,6 +239,40 @@ memguardPolicy:
   name: ""
 
 # ---------------------------------------------------------------------------
+# eBPF probes — disabled by default; requires explicit operator opt-in.
+#
+# Setting ebpf.enabled: true adds CAP_BPF + CAP_PERFMON to the memguard
+# sidecar container's securityContext.  This is a privileged operation:
+#
+#   • CAP_BPF  — allows loading and attaching BPF programs to kernel hooks.
+#   • CAP_PERFMON — allows reading performance counters (required by bcc).
+#
+# Security considerations before enabling:
+#   1. The BPF programs shipped with ml-memguard pass the Linux kernel
+#      verifier — they cannot read or write arbitrary kernel memory.
+#   2. The sidecar runs with a minimal seccomp profile; enabling eBPF also
+#      requires allowing the bpf(2) syscall in that profile.  See
+#      docs/ebpf/ebpf-kubernetes.md for the exact seccomp patch.
+#   3. Some cluster admission controllers (Kyverno, OPA Gatekeeper) deny
+#      CAP_BPF by default.  Add an exception for the memguard namespace.
+#   4. Enterprise security teams should read the full audit trail in
+#      docs/ebpf/ebpf-kubernetes.md before approving production rollout.
+#
+# Usage:
+#   helm upgrade my-vllm memguard/memguard \
+#     --set ebpf.enabled=true \
+#     --reuse-values
+#
+# Or via MemGuardPolicy CRD (no Helm rollout required after initial deploy):
+#   kubectl patch memguardpolicy default -n inference \
+#     --type merge -p '{"spec":{"ebpf":{"enabled":true}}}'
+# ---------------------------------------------------------------------------
+ebpf:
+  # Master switch — set to true to grant CAP_BPF + CAP_PERFMON to the sidecar.
+  # Disabled by default so baseline deployments carry zero additional privilege.
+  enabled: false
+
+# ---------------------------------------------------------------------------
 # Optional: memguard-cloud API key
 # Populate via: helm install ... --set memguardCloud.apiKey=mg_...
 # or by referencing an existing Secret (set existingSecret).

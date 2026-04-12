@@ -12,3 +12,5 @@ data:
   MEMGUARD_BACKEND:      {{ .Values.sidecar.backend | quote }}
   VLLM_MODEL_NAME:       {{ .Values.vllm.modelName  | quote }}
   MEMGUARD_POLICY_NAME:  {{ .Values.memguardPolicy.name | quote }}
+  # Propagated from ebpf.enabled (or overridden by MemGuardPolicy spec.ebpf.enabled)
+  MEMGUARD_EBPF_ENABLED: {{ .Values.ebpf.enabled | quote }}
