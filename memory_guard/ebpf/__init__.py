@@ -22,28 +22,52 @@ Usage::
 
 Graceful degradation
 --------------------
-When ``bcc`` is not installed or the kernel version is too old,
-:meth:`EBPFProbeManager.load` raises the appropriate exception.
-Callers are expected to wrap the call in a ``try/except`` block and
-fall back to poll-based detection when eBPF is unavailable.
+Use :class:`MemguardBPFSession` for automatic no-op when BPF is unavailable::
+
+    with MemguardBPFSession(on_high=on_high) as session:
+        if session.available:
+            logger.info("eBPF active")
+        server.serve_forever()
 
 Public re-exports
 -----------------
 All public types from the sub-modules are importable from this package::
 
     from memory_guard.ebpf import (
+        # Probe manager
         EBPFProbeManager,
+        # Graceful session wrapper
+        MemguardBPFSession,
+        # Backend / capability detector
+        BPFProbeLoader,
+        # Unified event wire format
+        MemguardBPFEvent,
+        EVENT_MEMORY_HIGH, EVENT_OOM_KILL, EVENT_PREEMPTION,
+        EVENT_PAGE_FAULT,  EVENT_MMAP_GROWTH,
+        # Low-level probe types (direct use)
         CgroupMemoryProbe, MemPressureEvent, LEVEL_HIGH, LEVEL_OOM,
         PreemptionProbe,   PreemptionEvent,
+        # Module-level availability flag
+        BPF_AVAILABLE,
     )
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 from typing import Callable, Optional
 
+from ._event import (
+    EVENT_MEMORY_HIGH,
+    EVENT_MMAP_GROWTH,
+    EVENT_OOM_KILL,
+    EVENT_PAGE_FAULT,
+    EVENT_PREEMPTION,
+    MemguardBPFEvent,
+)
+from ._loader import BPFProbeLoader
 from .cgroup_memory import (
     CgroupMemoryProbe,
     LEVEL_HIGH,
@@ -54,14 +78,33 @@ from .preemption import PreemptionEvent, PreemptionProbe
 
 logger = logging.getLogger(__name__)
 
+#: ``True`` when the current platform is Linux — a quick import-time hint.
+#: For full capability and kernel-version checks use :class:`BPFProbeLoader`.
+BPF_AVAILABLE: bool = sys.platform == "linux"
+
 __all__ = [
+    # Probe lifecycle
     "EBPFProbeManager",
+    # Graceful session wrapper
+    "MemguardBPFSession",
+    # Backend detector
+    "BPFProbeLoader",
+    # Unified event type
+    "MemguardBPFEvent",
+    "EVENT_MEMORY_HIGH",
+    "EVENT_OOM_KILL",
+    "EVENT_PREEMPTION",
+    "EVENT_PAGE_FAULT",
+    "EVENT_MMAP_GROWTH",
+    # Low-level probe types
     "CgroupMemoryProbe",
     "MemPressureEvent",
     "LEVEL_HIGH",
     "LEVEL_OOM",
     "PreemptionProbe",
     "PreemptionEvent",
+    # Module flag
+    "BPF_AVAILABLE",
 ]
 
 
@@ -252,3 +295,11 @@ class EBPFProbeManager:
                 self._on_preemption(event)
             except Exception:
                 logger.debug("[EBPFProbeManager] on_preemption raised", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Graceful session wrapper — imported here (after EBPFProbeManager is defined)
+# to avoid a circular import inside _session.py
+# ---------------------------------------------------------------------------
+
+from ._session import MemguardBPFSession  # noqa: E402

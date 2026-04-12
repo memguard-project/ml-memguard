@@ -42,7 +42,7 @@ unsloth = ["unsloth", "transformers>=4.30", "torch>=2.0", "accelerate>=1.1.0"]
 vllm = ["vllm>=0.4"]
 sglang = ["sglang>=0.3"]
 sidecar = ["httpx>=0.24"]   # stdlib HTTP server
-ebpf = ["bcc"]              # Linux eBPF cgroup memory + preemption probes (requires libbcc-dev)
+ebpf = ["bcc", "libbpf-python"]  # Linux eBPF probes: bcc (primary) + libbpf-python (fallback)
 all = ["torch>=2.0", "mlx>=0.10", "psutil>=5.9", "transformers>=4.30", "vllm>=0.4", "sglang>=0.3"]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "mypy>=1.0", "ruff>=0.1"]
 
