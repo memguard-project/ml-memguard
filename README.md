@@ -7,6 +7,9 @@ No more `gpu_memory_utilization` trial-and-error. No more KV cache crashes at 3 
 [![PyPI version](https://img.shields.io/pypi/v/ml-memguard.svg)](https://pypi.org/project/ml-memguard/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/pypi/pyversions/ml-memguard.svg)](https://pypi.org/project/ml-memguard/)
+[![Works with vLLM](https://img.shields.io/badge/vLLM-%E2%89%A50.4-green.svg)](https://github.com/vllm-project/vllm)
+[![Works with SGLang](https://img.shields.io/badge/SGLang-%E2%89%A50.3-green.svg)](https://github.com/sgl-project/sglang)
+[![Works with Unsloth](https://img.shields.io/badge/Unsloth-supported-green.svg)](https://github.com/unslothai/unsloth)
 
 **→ [How much is your team wasting on OOM crashes? Find your number.](https://REDACTED)**
 
@@ -37,6 +40,32 @@ pip install ml-memguard[sglang]         # + SGLang inference serving adapter
 - **Containers**: cgroups silently kill your process with no warning when you hit the memory limit.
 
 Existing solutions (PyTorch Lightning BatchSizeFinder, HuggingFace `accelerate`) are CUDA-only and reactive — they catch OOM exceptions that don't exist on Apple Silicon and do nothing for inference servers.
+
+## Quick-Start
+
+**→ [vLLM: stop KV cache crashes in 3 minutes](docs/quickstart/vllm.md)**
+
+```bash
+pip install ml-memguard[vllm]
+```
+
+```python
+from memory_guard import guard_vllm
+
+safe = guard_vllm(engine)                                         # pre-flight: finds safe max_num_seqs
+safe.monitor.on_shed_load = lambda u: lb.reduce_weight(host, 0)  # fire when KV cache hits 92%
+
+with safe.monitor.session():
+    server.serve_forever()
+```
+
+That is the entire integration. No config files. No separate process. The monitor runs in a background
+thread and fires your callback — the server keeps running, your load balancer stops sending traffic here.
+
+See the [full quick-start guide](docs/quickstart/vllm.md) for the before/after terminal output, CLI
+usage, Kubernetes sidecar setup, and common troubleshooting.
+
+---
 
 ## The Solution
 
