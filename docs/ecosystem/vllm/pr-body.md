@@ -21,7 +21,7 @@ docs: add memguard integration — proactive KV cache monitoring and OOM prevent
 
 ### What this adds
 
-Adds a new integration page for [ml-memguard](https://github.com/vgpprasad91/ml-memguard),
+Adds a new integration page for [ml-memguard](https://github.com/memguard-project/ml-memguard),
 an open-source library that provides proactive KV cache monitoring and OOM prevention for
 vLLM, under `docs/deployment/integrations/memguard.md`.
 

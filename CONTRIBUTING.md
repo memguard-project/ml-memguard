@@ -8,7 +8,7 @@ OOM prediction accuracy for everyone on that hardware class.
 
 ### What to report
 
-Open a [GitHub issue](https://github.com/vgpprasad91/ml-memguard/issues/new?template=hardware_report.yml)
+Open a [GitHub issue](https://github.com/memguard-project/ml-memguard/issues/new?template=hardware_report.yml)
 using the **Hardware Config Report** template. It captures:
 
 - GPU model and VRAM (e.g. RTX 4090 24GB, A100 80GB, M3 Max 36GB)
@@ -108,7 +108,7 @@ python bench/bench_accuracy.py --model mlx-community/Qwen3.5-9B-MLX-4bit --submi
 ```
 
 The `--submit` flag generates a pre-formatted GitHub issue body. Copy it, open
-a new issue at https://github.com/vgpprasad91/ml-memguard/issues/new, and paste.
+a new issue at https://github.com/memguard-project/ml-memguard/issues/new, and paste.
 
 ---
 

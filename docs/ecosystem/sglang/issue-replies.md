@@ -20,7 +20,7 @@ protect your serving availability in the meantime by monitoring `eviction_rate` 
 leading indicator — when eviction is high at moderate utilization, dead branches are
 the cause and you need to shed load before the tree exhausts the KV pool.
 
-I built **[ml-memguard](https://github.com/vgpprasad91/ml-memguard)** to track exactly
+I built **[ml-memguard](https://github.com/memguard-project/ml-memguard)** to track exactly
 this. It exposes `eviction_rate` alongside `kv_cache_usage_perc`, applies a rolling-max
 smoother to suppress false-recovery signals from the eviction drops, and fires
 `on_shed_load` before the KV pool is exhausted:
@@ -48,7 +48,7 @@ with safe.monitor.session():
     runtime.wait()
 ```
 
-3-minute setup: https://github.com/vgpprasad91/ml-memguard/blob/main/docs/quickstart/sglang.md
+3-minute setup: https://github.com/memguard-project/ml-memguard/blob/main/docs/quickstart/sglang.md
 
 I also submitted a PR to add this to the SGLang integrations docs: {PR_URL}
 ```
@@ -69,7 +69,7 @@ and tree overhead is smaller in SGLang, which is why you hit OOM where vLLM does
 The fix is to binary-search for the right `--mem-fraction-static` value for your specific
 model+GPU combination rather than porting vLLM's utilization fraction directly.
 
-**[ml-memguard](https://github.com/vgpprasad91/ml-memguard)** does this automatically:
+**[ml-memguard](https://github.com/memguard-project/ml-memguard)** does this automatically:
 
 ```python
 from memory_guard import guard_sglang
@@ -92,7 +92,7 @@ It reads your model's architecture from the running runtime, accounts for RadixA
 tree overhead, and gives you the exact `--max-running-requests` and
 `--mem-fraction-static` values to use. Start from those numbers and the OOM goes away.
 
-3-minute setup: https://github.com/vgpprasad91/ml-memguard/blob/main/docs/quickstart/sglang.md
+3-minute setup: https://github.com/memguard-project/ml-memguard/blob/main/docs/quickstart/sglang.md
 
 I also submitted a PR to add this to the SGLang integrations docs: {PR_URL}
 ```

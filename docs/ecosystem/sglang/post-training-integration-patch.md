@@ -17,7 +17,7 @@ Then add the memguard bullet under it.
 
 ## Production Monitoring & OOM Prevention
 
-- [**ml-memguard**](https://github.com/vgpprasad91/ml-memguard): Proactive KV cache
+- [**ml-memguard**](https://github.com/memguard-project/ml-memguard): Proactive KV cache
   monitor and OOM prevention for SGLang — tracks RadixAttention eviction pressure,
   fragmentation ratio, and allocation velocity, fires load-shed signals before KV cache
   exhaustion, and works on both CUDA and Apple Silicon Metal backends.

@@ -1,6 +1,6 @@
 # memguard
 
-[ml-memguard](https://github.com/vgpprasad91/ml-memguard) is a proactive KV cache monitor
+[ml-memguard](https://github.com/memguard-project/ml-memguard) is a proactive KV cache monitor
 and OOM prevention layer for vLLM. It calculates the largest safe `max_num_seqs` before the
 server starts, monitors KV cache utilization in a background thread, and fires load-shed
 signals before the engine runs out of memory — without touching vLLM internals or
@@ -92,6 +92,6 @@ pod from the Service endpoint set — no new traffic, zero vLLM code changes.
 
 ## Further reading
 
-- [Quick-start guide (3 minutes)](https://github.com/vgpprasad91/ml-memguard/blob/main/docs/quickstart/vllm.md)
+- [Quick-start guide (3 minutes)](https://github.com/memguard-project/ml-memguard/blob/main/docs/quickstart/vllm.md)
 - [PyPI](https://pypi.org/project/ml-memguard/)
-- [GitHub](https://github.com/vgpprasad91/ml-memguard)
+- [GitHub](https://github.com/memguard-project/ml-memguard)

@@ -52,10 +52,10 @@ memguard-sidecar           = "memory_guard.sidecar:main"
 memguard-explain-telemetry = "memory_guard.telemetry_explain:main"
 
 [project.urls]
-Homepage = "https://github.com/vgpprasad91/ml-memguard"
-Repository = "https://github.com/vgpprasad91/ml-memguard"
-Issues = "https://github.com/vgpprasad91/ml-memguard/issues"
-Changelog = "https://github.com/vgpprasad91/ml-memguard/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/memguard-project/ml-memguard"
+Repository = "https://github.com/memguard-project/ml-memguard"
+Issues = "https://github.com/memguard-project/ml-memguard/issues"
+Changelog = "https://github.com/memguard-project/ml-memguard/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["memory_guard"]

@@ -14,7 +14,7 @@ allocated after a crashed vLLM container, and the V1 engine's pre-load memory ch
 counting that stale allocation against the budget before the model even loads.
 
 I ran into the same pattern and built a small tool to handle both sides:
-**[ml-memguard](https://github.com/vgpprasad91/ml-memguard)** — it runs a pre-flight
+**[ml-memguard](https://github.com/memguard-project/ml-memguard)** — it runs a pre-flight
 check that binary-searches for the largest `max_num_seqs` that actually fits your live
 GPU budget (accounting for what's already allocated), and starts a background watchdog
 that auto-restarts vLLM cleanly if the process exits.
@@ -45,7 +45,7 @@ status:         FITS
 For the zombie-process problem specifically, the `VLLMWatchdog` restarts with a clean
 CUDA context each time so stale memory from the previous crash doesn't carry over.
 
-3-minute setup guide: https://github.com/vgpprasad91/ml-memguard/blob/main/docs/quickstart/vllm.md
+3-minute setup guide: https://github.com/memguard-project/ml-memguard/blob/main/docs/quickstart/vllm.md
 
 I also opened a PR to add this to the vLLM integrations docs: {PR_URL}
 ```
@@ -62,7 +62,7 @@ moderate but free memory dwindles until new requests OOM — is exactly the fail
 that `kv_cache_usage_perc` misses. That metric is a snapshot of block utilization, not
 a velocity signal. By the time it shows danger, you're already out of headroom.
 
-I built **[ml-memguard](https://github.com/vgpprasad91/ml-memguard)** specifically to
+I built **[ml-memguard](https://github.com/memguard-project/ml-memguard)** specifically to
 catch this: it tracks `kv_velocity_mbps` (rate of memory growth, not just the level) and
 `fragmentation_ratio` (contiguous free blocks, not just total free blocks) as separate
 signals. When velocity is high and fragmentation is rising, the `on_shed_load` callback
@@ -95,7 +95,7 @@ emits signals. Your replica keeps taking traffic until you decide to shed.
 This won't fix the underlying vision encoder leak (that needs a vLLM fix), but it
 prevents the leak from killing your serving availability in the meantime.
 
-3-minute setup: https://github.com/vgpprasad91/ml-memguard/blob/main/docs/quickstart/vllm.md
+3-minute setup: https://github.com/memguard-project/ml-memguard/blob/main/docs/quickstart/vllm.md
 
 I also submitted a PR to add memguard to the vLLM integrations docs: {PR_URL}
 ```

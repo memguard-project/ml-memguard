@@ -24,7 +24,7 @@ to vLLM or your application.
 
 ```bash
 # 1. Clone (or cd into the repo if already cloned)
-git clone https://github.com/vgpprasad91/ml-memguard
+git clone https://github.com/memguard-project/ml-memguard
 cd ml-memguard/examples/vllm-quickstart
 
 # 2. Configure

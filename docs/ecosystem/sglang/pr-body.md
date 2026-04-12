@@ -23,7 +23,7 @@ docs: add memguard — proactive KV cache monitoring and OOM prevention for SGLa
 
 Adds a new "Production Monitoring & OOM Prevention" section to
 `docs/references/post_training_integration.md` with an entry for
-[ml-memguard](https://github.com/vgpprasad91/ml-memguard), an open-source KV cache
+[ml-memguard](https://github.com/memguard-project/ml-memguard), an open-source KV cache
 monitor designed for SGLang production deployments.
 
 ### Why

@@ -516,7 +516,7 @@ Identical to `guard_trainer` but named for TRL `SFTTrainer` workflows.
 
 **Tested** = verified on real hardware. **Reported** = community-reported. **Planned** = implementation exists, not yet verified on real hardware. **—** = not applicable.
 
-[→ Report your config](https://github.com/vgpprasad91/ml-memguard/issues/new?template=hardware_report.yml) | [→ Full hardware discussion](https://github.com/vgpprasad91/ml-memguard/discussions)
+[→ Report your config](https://github.com/memguard-project/ml-memguard/issues/new?template=hardware_report.yml) | [→ Full hardware discussion](https://github.com/memguard-project/ml-memguard/discussions)
 
 | GPU / Device         | VRAM   | vLLM    | SGLang  | Unsloth | HF Trainer | mlx_lm  |
 |----------------------|--------|---------|---------|---------|------------|---------|
@@ -535,7 +535,7 @@ The M4 Max 36 GB + mlx_lm row is the only configuration verified end-to-end on r
 All other "Planned" entries have working code paths and pass unit tests but have not been
 verified against a running vLLM/SGLang server on those specific GPUs.
 
-**Help us fill in the gaps**: open a [Hardware Config Report](https://github.com/vgpprasad91/ml-memguard/issues/new?template=hardware_report.yml)
+**Help us fill in the gaps**: open a [Hardware Config Report](https://github.com/memguard-project/ml-memguard/issues/new?template=hardware_report.yml)
 with your GPU, framework, and whether memguard prevented an OOM.
 Each report turns a "Planned" into a "Reported" or "Tested" cell.
 
@@ -596,7 +596,7 @@ python bench/bench_accuracy.py --model mlx-community/Mistral-7B-Instruct-v0.3-4b
 python bench/bench_accuracy.py --model mlx-community/Qwen3.5-9B-MLX-4bit --submit
 ```
 
-Then open a [GitHub issue](https://github.com/vgpprasad91/ml-memguard/issues/new) with the output. We'll add your results to the accuracy table above.
+Then open a [GitHub issue](https://github.com/memguard-project/ml-memguard/issues/new) with the output. We'll add your results to the accuracy table above.
 
 **Devices we especially need data from**:
 - M1/M2 MacBook Air (8GB, 16GB)
