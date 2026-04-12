@@ -75,7 +75,7 @@ containers:
       - sh
       - -c
       - |
-        pip install 'ml-memguard[cloud]' -q &&
+        pip install ml-memguard -q &&
         python -m memory_guard.sidecar \
           --vllm-url http://localhost:8000 \
           --port 8001

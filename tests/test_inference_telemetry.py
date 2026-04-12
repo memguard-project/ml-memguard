@@ -139,7 +139,7 @@ class TestComputeVelocity:
 
 class TestKVCacheMonitorTelemetryUpload:
     def test_upload_skips_silently_when_no_backend(self):
-        """No fleet backend → _upload_inference_telemetry does not raise."""
+        """No backend plugin → _upload_inference_telemetry does not raise."""
         mon = KVCacheMonitor(
             poll_fn=lambda: (50, 100),
             telemetry_upload_interval=0.0,
@@ -233,7 +233,7 @@ class TestKVCacheMonitorTelemetryUpload:
 
 class TestWorkerMissingFieldDefaulting:
     """Verify the Python client sends 0.0 for missing inference fields so
-    the fleet backend stores them as 0 (backward-compatible with old callers)."""
+    the backend plugin stores them as 0 (backward-compatible with old callers)."""
 
     def test_default_telemetry_has_zero_inference_fields(self):
         """An InferenceTelemetry() with all defaults produces a payload where

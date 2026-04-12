@@ -3,7 +3,7 @@
 ``InferenceTelemetry`` captures the seven signals that are invisible to
 vLLM/SGLang's own Prometheus endpoints but are critical for predicting OOM
 events before they happen.  The ``KVCacheMonitor`` populates these on every
-monitoring cycle and passes them to the active fleet backend (if any).
+monitoring cycle and passes them to the active backend plugin (if any).
 
 Signals
 -------
@@ -55,7 +55,7 @@ class InferenceTelemetry:
     """Inference monitoring signals collected during one poll cycle.
 
     All numeric fields default to ``0.0`` / ``0`` so partial records are safe
-    — the fleet backend treats zero as "not measured" rather than "zero pressure".
+    — the backend plugin treats zero as "not measured" rather than "zero pressure".
 
     Attributes
     ----------

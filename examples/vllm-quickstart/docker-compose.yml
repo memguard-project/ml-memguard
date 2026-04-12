@@ -7,7 +7,7 @@ version: "3.9"
 #   - sidecar:8001  — memguard sidecar (/healthz and /readyz for k8s probes)
 #
 # Usage:
-#   cp .env.example .env   # fill in MEMGUARD_BACKEND_KEY, MODEL_NAME, HF_TOKEN
+#   cp .env.example .env   # fill in MODEL_NAME, HF_TOKEN
 #   docker compose up
 #
 # Test endpoints:
@@ -56,13 +56,11 @@ services:
     image: python:3.11-slim
     ports:
       - "${SIDECAR_PORT:-8001}:8001"
-    environment:
-      MEMGUARD_BACKEND_KEY: "${MEMGUARD_BACKEND_KEY}"
-    # Install ml-memguard with cloud support, then start the sidecar.
+    # Install ml-memguard, then start the sidecar.
     # Polls vLLM's /metrics endpoint every MEMGUARD_POLL_INTERVAL seconds
     # and exposes /healthz + /readyz on port 8001.
     command: >
-      sh -c "pip install 'ml-memguard[cloud]' --quiet --no-cache-dir &&
+      sh -c "pip install ml-memguard --quiet --no-cache-dir &&
              python -m memory_guard.sidecar
                --vllm-url      http://vllm:8000
                --host          0.0.0.0

@@ -127,7 +127,7 @@ If you cannot modify your vLLM launch code, run the memguard sidecar alongside y
 The sidecar polls vLLM's Prometheus `/metrics` endpoint and exposes `/readyz`:
 
 ```bash
-pip install 'ml-memguard[cloud]'
+pip install ml-memguard
 python -m memory_guard.sidecar \
     --vllm-url http://localhost:8000 \
     --port 8001

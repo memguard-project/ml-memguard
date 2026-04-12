@@ -11,11 +11,11 @@ Runs two containers side-by-side:
 | `vllm` | 8000 | vLLM OpenAI-compatible inference server |
 | `sidecar` | 8001 | memguard sidecar — `/healthz` + `/readyz` probes |
 
-The sidecar polls vLLM's Prometheus `/metrics` endpoint every 5 seconds,
-sends the KV cache signals to the memguard cloud prediction API, and reflects
-the OOM risk score through the `/readyz` probe.
+The sidecar polls vLLM's Prometheus `/metrics` endpoint every 5 seconds and
+reflects the KV cache utilization through the `/readyz` probe using rule-based
+OOM thresholds.
 
-**When the predicted OOM probability exceeds 0.70**, `/readyz` returns `503`.
+**When KV cache utilization exceeds 92%**, `/readyz` returns `503`.
 In Kubernetes, a `503` readiness response removes the pod from the Service
 endpoint set — new requests stop routing to this replica with zero code changes
 to vLLM or your application.
@@ -29,7 +29,7 @@ cd ml-memguard/examples/vllm-quickstart
 
 # 2. Configure
 cp .env.example .env
-# Edit .env: set MEMGUARD_BACKEND_KEY, MODEL_NAME, HF_TOKEN
+# Edit .env: set MODEL_NAME, HF_TOKEN
 
 # 3. Start
 docker compose up
@@ -76,18 +76,12 @@ containers:
       - sh
       - -c
       - |
-        pip install 'ml-memguard[cloud]' -q &&
+        pip install ml-memguard -q &&
         python -m memory_guard.sidecar \
           --vllm-url http://localhost:8000 \
           --port 8001
     ports:
       - containerPort: 8001
-    env:
-      - name: MEMGUARD_BACKEND_KEY
-        valueFrom:
-          secretKeyRef:
-            name: memguard-secret
-            key: api-key
     readinessProbe:
       httpGet:
         path: /readyz
@@ -116,17 +110,9 @@ MODEL_NAME=facebook/opt-125m docker compose up
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `MEMGUARD_BACKEND_KEY` | Yes | — | Your memguard cloud API key |
 | `MODEL_NAME` | Yes | — | HuggingFace model ID |
 | `HF_TOKEN` | For gated models | — | HuggingFace access token |
 | `MEMGUARD_SHED_THRESHOLD` | No | `0.70` | OOM probability threshold for 503 |
 | `MEMGUARD_POLL_INTERVAL` | No | `5.0` | Seconds between KV cache polls |
 | `VLLM_PORT` | No | `8000` | Host port for vLLM |
 | `SIDECAR_PORT` | No | `8001` | Host port for sidecar |
-
-## Get an API key
-
-Sign up at [memguard.dev](https://memguard.dev) to get a free API key.
-Without a key the sidecar still works — it falls back to rule-based thresholds
-(shed load at 92% KV cache utilization) and `/readyz` always returns 200 until
-the reactive threshold is crossed.

@@ -1,13 +1,13 @@
-"""Fleet backend plugin registry.
+"""Backend plugin registry.
 
-ml-memguard is a pure open-source library with zero commercial dependencies.
-Fleet intelligence (policy sync, OOM prediction, telemetry) is provided by
-optional backend plugins installed separately.
+ml-memguard is a pure open-source library with zero external dependencies.
+Optional backend plugins can be installed separately to provide additional
+capabilities (policy sync, OOM prediction, telemetry).
 
-Plugin registration (in the backend package's pyproject.toml)::
+Plugin registration (in the plugin package's pyproject.toml)::
 
     [project.entry-points."memory_guard.backends"]
-    fleet = "your_package.fleet:YourFleetBackend"
+    my_plugin = "your_package:YourBackend"
 
 The backend class must satisfy the :class:`FleetBackend` protocol.  If no
 backend is installed all functions in this module silently return ``None`` /
@@ -26,16 +26,15 @@ logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class FleetBackend(Protocol):
-    """Interface that fleet backend plugins must implement.
+    """Interface that backend plugins must implement.
 
     Every method must be safe to call from a background thread, must never
     raise (swallow all exceptions internally), and must return ``None`` /
-    ``False`` on any failure so callers can treat the fleet layer as
-    best-effort.
+    ``False`` on any failure so callers can treat the backend as best-effort.
     """
 
     def upload_policy(self, policy_data: Dict[str, Any]) -> bool:
-        """Upload the local Q-table to the fleet store.  Returns True on success."""
+        """Upload the local Q-table to the backend store.  Returns True on success."""
         ...
 
     def download_policy(self) -> Optional[Dict[str, Any]]:
@@ -78,7 +77,7 @@ _discovered: bool = False
 
 
 def _discover() -> None:
-    """Load the first registered fleet backend (called lazily on first use)."""
+    """Load the first registered backend plugin (called lazily on first use)."""
     global _backend, _discovered
     if _discovered:
         return
@@ -93,7 +92,7 @@ def _discover() -> None:
                 if isinstance(instance, FleetBackend):
                     _backend = instance
                     logger.debug(
-                        "[memory-guard] Fleet backend loaded: %s", ep.name
+                        "[memory-guard] Backend plugin loaded: %s", ep.name
                     )
                     break
             except Exception as exc:
@@ -105,7 +104,7 @@ def _discover() -> None:
 
 
 def get_backend() -> Optional[FleetBackend]:
-    """Return the active fleet backend, or ``None`` if none is installed."""
+    """Return the active backend plugin, or ``None`` if none is installed."""
     _discover()
     return _backend
 
@@ -131,7 +130,7 @@ def predict_oom(
 
 
 def upload_policy(policy_data: Dict[str, Any]) -> bool:
-    """Upload Q-table to fleet store.  Returns False when no backend is installed."""
+    """Upload Q-table to backend store.  Returns False when no backend is installed."""
     b = get_backend()
     if b is None:
         return False

@@ -300,9 +300,9 @@ def main() -> None:
     p.add_argument("--poll-interval", type=float, default=5.0, dest="poll_interval",
                    help="Seconds between KV cache polls (default: 5.0)")
     p.add_argument("--model-name",    default="", dest="model_name",
-                   help="Model identifier forwarded to the fleet backend")
+                   help="Model identifier attached to monitoring signals")
     p.add_argument("--backend",       default="",
-                   help="Backend string forwarded to the fleet backend")
+                   help="Backend framework string attached to monitoring signals")
     p.add_argument("--smoothing-window", type=int, default=1, dest="smoothing_window",
                    help="Rolling-max window for KV utilization smoothing (default: 1; use 3 for SGLang)")
     args = p.parse_args()

@@ -133,29 +133,29 @@ def _str_to_action(s: str) -> ConfigAction:
 # ---------------------------------------------------------------------------
 
 def _merge_cloud_policy(policy: "BanditPolicy") -> None:
-    """Merge cloud Q-table entries into *policy* in-place.
+    """Merge downloaded Q-table entries into *policy* in-place.
 
     Strategy: weighted average by ``num_updates`` for entries that exist in
-    both; cloud-only entries are added directly (free knowledge on cold start).
-    Never raises — cloud failures are silently ignored.
+    both; remote-only entries are added directly (free knowledge on cold start).
+    Never raises — backend failures are silently ignored.
     """
     try:
         from .backends import download_policy as _download_policy
-        cloud_data = _download_policy()
-        if not cloud_data or "q_table" not in cloud_data:
+        remote_data = _download_policy()
+        if not remote_data or "q_table" not in remote_data:
             return
 
-        fleet_contributors: int = int(cloud_data.get("fleet_contributors", 0))
-        if fleet_contributors == 0:
+        remote_contributors: int = int(remote_data.get("fleet_contributors", 0))
+        if remote_contributors == 0:
             logger.debug(
-                "[memory-guard] Fleet cold start — you are the first contributor."
+                "[memory-guard] No prior policy data — starting fresh."
             )
 
-        cloud_updates: int = int(cloud_data.get("num_updates", 0))
+        remote_updates: int = int(remote_data.get("num_updates", 0))
         local_updates: int = policy.num_updates
-        total: int = cloud_updates + local_updates
+        total: int = remote_updates + local_updates
 
-        for sk_str, actions_raw in cloud_data["q_table"].items():
+        for sk_str, actions_raw in remote_data["q_table"].items():
             try:
                 sk = _str_to_state_key(sk_str)
             except (ValueError, KeyError):
@@ -163,31 +163,29 @@ def _merge_cloud_policy(policy: "BanditPolicy") -> None:
             if not isinstance(actions_raw, dict):
                 continue
 
-            for a_str, cloud_q in actions_raw.items():
+            for a_str, remote_q in actions_raw.items():
                 try:
                     action = _str_to_action(a_str)
-                    cloud_q = float(cloud_q)
+                    remote_q = float(remote_q)
                 except (ValueError, KeyError):
                     continue
 
                 local_q = policy._q.get(sk, {}).get(action)
                 if local_q is None:
-                    # Cloud has experience we don't — adopt it
-                    policy._q.setdefault(sk, {})[action] = cloud_q
+                    # Remote has experience we don't — adopt it
+                    policy._q.setdefault(sk, {})[action] = remote_q
                 elif total > 0:
                     # Weighted average: more updates → more influence
                     w_local = local_updates / total
-                    w_cloud = cloud_updates / total
-                    policy._q[sk][action] = w_local * local_q + w_cloud * cloud_q
+                    w_remote = remote_updates / total
+                    policy._q[sk][action] = w_local * local_q + w_remote * remote_q
 
         logger.debug(
-            "[memory-guard] Merged cloud policy: %d states now loaded (%d fleet contributor%s).",
+            "[memory-guard] Policy merged: %d states loaded.",
             policy.num_states,
-            fleet_contributors,
-            "s" if fleet_contributors != 1 else "",
         )
     except Exception as exc:
-        logger.debug("[memory-guard] Cloud policy merge skipped: %s", exc)
+        logger.debug("[memory-guard] Policy merge skipped: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +489,7 @@ class BanditPolicy:
         except Exception as exc:
             logger.warning("[memory-guard] Could not save RL policy: %s", exc)
 
-        # Cloud sync — fire-and-forget; never blocks or raises
+        # Backend sync — fire-and-forget; never blocks or raises
         try:
             from .backends import upload_policy as _upload_policy
             _upload_policy(payload)
