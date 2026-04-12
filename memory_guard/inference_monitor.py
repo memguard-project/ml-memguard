@@ -392,15 +392,21 @@ class KVCacheMonitor:
                 # Cloud unavailable — fall through to reactive thresholds (no-op here)
                 return
 
-            p      = float(result.get("oom_probability", 0.0))
-            horizon = result.get("horizon_seconds", "?")
+            p            = float(result.get("oom_probability", 0.0))
+            horizon      = result.get("horizon_seconds", "?")
+            model_source = result.get("model_source", "unknown")
+
+            logger.debug(
+                "[memory-guard] predict_oom: p=%.3f source=%s horizon=%s",
+                p, model_source, horizon,
+            )
 
             if p > 0.92 and self.restart_callback is not None:
                 now = time.time()
                 if (now - self._last_predictive_restart) >= self._predictive_restart_cooldown:
                     self._emit_log(
-                        f"[memory-guard] Predictive OOM p={p:.2f} ≥ 0.92 → "
-                        f"planned restart (horizon ≈ {horizon}s)"
+                        f"[memory-guard] Predictive OOM p={p:.2f} ≥ 0.92 "
+                        f"[{model_source}] → planned restart (horizon ≈ {horizon}s)"
                     )
                     self._last_predictive_restart = now
                     self._fire_restart()
@@ -409,8 +415,8 @@ class KVCacheMonitor:
                 with self._lock:
                     self._last_shed_load_time = time.time()
                 self._emit_log(
-                    f"[memory-guard] Predictive OOM p={p:.2f} > 0.70 → "
-                    f"shed_load (horizon ≈ {horizon}s)"
+                    f"[memory-guard] Predictive OOM p={p:.2f} > 0.70 "
+                    f"[{model_source}] → shed_load (horizon ≈ {horizon}s)"
                 )
                 self._fire(self.on_shed_load, utilization, "on_shed_load (predictive)")
 
