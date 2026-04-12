@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """vLLM + memguard-allocator: GPU allocation telemetry integration.
 
-Demonstrates the four-line setup that layers the BSL memguard-allocator
-allocator hooks under the OSS KVCacheMonitor, giving per-request OOM
+Demonstrates the four-line setup that layers the proprietary
+memguard-allocator hooks under the OSS KVCacheMonitor, giving per-request OOM
 telemetry (near-miss count, allocation velocity, fragmentation ratio)
 alongside KV cache utilization.
 
 Stack
 -----
 ┌─────────────────────────────────────────────────┐
-│  ml-memguard  (OSS / Apache-2.0 after 2030)     │  KVCacheMonitor
+│  ml-memguard  (OSS / Apache-2.0)                │  KVCacheMonitor
 │    KVCacheMonitor — kv-block utilization         │  policy & callbacks
 ├─────────────────────────────────────────────────┤
-│  memguard-allocator  (BSL-1.1)                  │  allocator hooks
+│  memguard-allocator  (Proprietary)              │  allocator hooks
 │    CUDA / Metal ring-buffer telemetry            │  + ring buffer
 ├─────────────────────────────────────────────────┤
 │  Cloud telemetry backend  (optional)             │  remote metrics

@@ -13,12 +13,12 @@ Together they form a three-tier observability stack:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  ml-memguard  (OSS / Apache-2.0 after 2030-04-11)              │
+│  ml-memguard  (OSS / Apache-2.0)                                │
 │  • KVCacheMonitor — KV block utilization → load-shed callbacks  │
 │  • VLLMWatchdog  — process health + auto-restart                │
 │  • MemGuardPolicy CRD — Kubernetes hot-reload                   │
 ├─────────────────────────────────────────────────────────────────┤
-│  memguard-allocator  (BSL-1.1)                                  │
+│  memguard-allocator  (Proprietary)                              │
 │  • CUDA: replaces PyTorch's caching allocator (mgcuda_malloc)   │
 │  • Metal: polls mlx.core.get_active_memory() every 50 ms       │
 │  • ring buffer: near_miss_count, allocation_velocity_mbps,      │
