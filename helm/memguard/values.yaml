@@ -1,0 +1,167 @@
+# --------------------------------------------------------------------------- #
+# memguard Helm chart — values.yaml                                           #
+# --------------------------------------------------------------------------- #
+
+# ---------------------------------------------------------------------------
+# vLLM container
+# ---------------------------------------------------------------------------
+vllm:
+  image:
+    repository: vllm/vllm-openai
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  # HuggingFace model ID — required
+  modelName: ""
+
+  # HuggingFace access token (needed for gated models).
+  # Set via --set vllm.hfToken=hf_... or mount a Secret instead.
+  hfToken: ""
+
+  # vLLM launch flags appended after --model
+  extraArgs:
+    - --host
+    - "0.0.0.0"
+    - --port
+    - "8000"
+    - --enable-prefix-caching
+    - --max-model-len
+    - "4096"
+
+  port: 8000
+
+  resources:
+    requests:
+      memory: "16Gi"
+      cpu: "4"
+    limits:
+      memory: "64Gi"
+      cpu: "16"
+      nvidia.com/gpu: "1"
+
+  # HuggingFace model cache volume (PVC name or empty to use emptyDir)
+  modelCachePVC: ""
+
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8000
+    initialDelaySeconds: 60
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+
+  readinessProbe:
+    # Delegates to the memguard sidecar /readyz — do NOT set this to /health.
+    # Kubernetes removes the pod from the Service endpoint set when /readyz
+    # returns 503, which is the core load-shedding mechanism.
+    httpGet:
+      path: /readyz
+      port: 8001
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 1
+
+# ---------------------------------------------------------------------------
+# memguard sidecar
+# ---------------------------------------------------------------------------
+sidecar:
+  image:
+    repository: python
+    tag: "3.11-slim"
+    pullPolicy: IfNotPresent
+
+  # OOM probability threshold above which /readyz returns 503 (0–1).
+  # 0.70 is a conservative default; lower for more aggressive shedding.
+  shedThreshold: 0.70
+
+  # Seconds between KV cache polls from vLLM /metrics
+  pollInterval: 5.0
+
+  # Rolling-max smoothing window for KV utilization.
+  # Use 1 for vLLM (paged attention, no smoothing needed).
+  # Use 3 for SGLang (RadixAttention eviction drops require smoothing).
+  smoothingWindow: 1
+
+  # Model name forwarded to monitoring signals and memguard-cloud telemetry.
+  # Defaults to vllm.modelName when left empty.
+  modelName: ""
+
+  # Hardware backend string attached to telemetry (e.g. "cuda", "metal").
+  # Auto-detected when empty.
+  backend: ""
+
+  port: 8001
+
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: 8001
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# Deployment
+# ---------------------------------------------------------------------------
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Node selector, tolerations, and affinity for GPU node scheduling
+nodeSelector:
+  # Uncomment to pin to GPU nodes:
+  # accelerator: nvidia-tesla-h100
+  {}
+
+tolerations: []
+#  - key: nvidia.com/gpu
+#    operator: Exists
+#    effect: NoSchedule
+
+affinity: {}
+
+podAnnotations: {}
+podSecurityContext: {}
+
+# Image pull secrets (for private registries or gated HF model images)
+imagePullSecrets: []
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  # vLLM inference port
+  vllmPort: 8000
+  # memguard sidecar port (probed by Kubernetes readinessProbe)
+  sidecarPort: 8001
+
+# ---------------------------------------------------------------------------
+# ServiceAccount
+# ---------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# ---------------------------------------------------------------------------
+# Optional: memguard-cloud API key
+# Populate via: helm install ... --set memguardCloud.apiKey=mg_...
+# or by referencing an existing Secret (set existingSecret).
+# ---------------------------------------------------------------------------
+memguardCloud:
+  apiKey: ""
+  existingSecret: ""
+  existingSecretKey: "MEMGUARD_API_KEY"

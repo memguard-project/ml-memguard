@@ -1,0 +1,47 @@
+╔══════════════════════════════════════════════════════════╗
+║  memguard {{ .Chart.AppVersion }} — Kubernetes sidecar ready           ║
+╚══════════════════════════════════════════════════════════╝
+
+1. Wait for the pod to be running:
+
+   kubectl rollout status deployment/{{ include "memguard.fullname" . }} \
+     --namespace {{ .Release.Namespace }}
+
+2. Test the endpoints (in a separate terminal, port-forward first):
+
+   kubectl port-forward \
+     deployment/{{ include "memguard.fullname" . }} \
+     8000:{{ .Values.vllm.port }} 8001:{{ .Values.sidecar.port }} \
+     --namespace {{ .Release.Namespace }}
+
+   # vLLM liveness
+   curl http://localhost:8000/health
+
+   # memguard liveness (always 200)
+   curl http://localhost:8001/healthz
+
+   # memguard readiness (200 = safe, 503 = KV cache above threshold)
+   curl -i http://localhost:8001/readyz
+
+3. Example healthy /readyz response:
+   {"status": "ready", "oom_probability": 0.12, "threshold": {{ .Values.sidecar.shedThreshold }}}
+
+4. Example /readyz response under OOM pressure:
+   {"status": "not_ready", "oom_probability": 0.84, "threshold": {{ .Values.sidecar.shedThreshold }}}
+   HTTP/1.1 503 Service Unavailable
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Configuration summary
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Model:            {{ required "vllm.modelName is required" .Values.vllm.modelName }}
+  Shed threshold:   {{ .Values.sidecar.shedThreshold }} ({{ mulf .Values.sidecar.shedThreshold 100 | int }}% OOM probability)
+  Poll interval:    {{ .Values.sidecar.pollInterval }}s
+  Smoothing window: {{ .Values.sidecar.smoothingWindow }}
+  Replicas:         {{ .Values.replicaCount }}
+{{- if or .Values.memguardCloud.apiKey .Values.memguardCloud.existingSecret }}
+  memguard-cloud:   ENABLED (fleet telemetry active)
+{{- else }}
+  memguard-cloud:   disabled (set memguardCloud.apiKey to activate)
+{{- end }}
+
+Documentation: https://github.com/memguard-project/ml-memguard/blob/main/helm/memguard/README.md

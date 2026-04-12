@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "memguard.fullname" . }}
+  labels:
+    {{- include "memguard.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "memguard.selectorLabels" . | nindent 4 }}
+  ports:
+    # vLLM OpenAI-compatible inference API
+    - name: inference
+      port: {{ .Values.service.vllmPort }}
+      targetPort: inference
+      protocol: TCP
+    # memguard sidecar — /healthz (liveness) and /readyz (readiness)
+    - name: sidecar
+      port: {{ .Values.service.sidecarPort }}
+      targetPort: sidecar
+      protocol: TCP
