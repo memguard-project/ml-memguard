@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Guru Prasad Venkata Raghavan <vguruprasad91@gmail.com>
+Date: Sun, 13 Apr 2026 00:00:00 +0000
+Subject: [PATCH] metrics: emit OTel Gen AI KV cache semantic convention signals
+
+Adds three Prometheus gauges that implement the OpenTelemetry Gen AI
+semantic conventions for KV cache memory pressure (pending merge of
+opentelemetry-specification/semantic-conventions#NNNN):
+
+  gen_ai_server_kv_cache_eviction_rate          (evictions / s)
+  gen_ai_server_kv_cache_allocation_velocity    (MB / s)
+  gen_ai_server_scheduler_preemption_rate       (preemptions / s)
+
+These are the three signals consumed by the memguard-cloud GBT OOM
+classifier via the /v1/ingest/otlp endpoint.  The OTel Collector
+filter/mkcp_signals processor selects only these three names so no
+other vLLM Prometheus metrics are forwarded.
+
+Feature is opt-in: set VLLM_OTEL_KV_METRICS_ENABLED=true before
+starting vLLM.  When the env var is absent (the default), no new
+objects are allocated and the code path is never entered — zero
+overhead for the common case.
+
+Rate computation lives in the new vllm/v1/metrics/kv_metrics.py
+module so it can be unit-tested independently of the Prometheus
+infrastructure.
+
+OTel spec PR: opentelemetry-specification/semantic-conventions#NNNN
+(update this before submission)
+
+Base commit: 8d825b87d6590ca971823890f9705988b8709add
+Apply check: git apply --check 0001-emit-otel-gen-ai-kv-cache-metrics.patch
+---
+ vllm/v1/metrics/kv_metrics.py |  148 ++++++++++++++++++++++++++++++++
+ vllm/v1/metrics/loggers.py    |   86 ++++++++++++++++++-
+ 2 files changed, 234 insertions(+), 0 deletions(-)
+ create mode 100644 vllm/v1/metrics/kv_metrics.py
+
+diff --git a/vllm/v1/metrics/kv_metrics.py b/vllm/v1/metrics/kv_metrics.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/vllm/v1/metrics/kv_metrics.py
+@@ -0,0 +1,148 @@
++"""vllm/v1/metrics/kv_metrics.py
++
++Rate-based KV cache telemetry signals for the OTel Gen AI semantic
++conventions (gen_ai.server.kv_cache.* and gen_ai.server.scheduler.*).
++
++This module is only imported when VLLM_OTEL_KV_METRICS_ENABLED=true.
++It has no Prometheus dependency — PrometheusStatLogger owns the gauge
++objects and calls update() to get fresh values on each scheduler tick.
++
++Three signals are computed from raw scheduler counters:
++
++  eviction_rate          — KV cache block evictions per second.
++                           Derived from kv_cache_eviction_events emitted
++                           by the scheduler each step.
++
++  allocation_velocity    — KV cache growth in MB/s over the last interval.
++                           Positive during prefill; zero or negative when
++                           sequences are completing faster than arriving.
++                           Returned as MB/s when kv_block_size_mb > 0,
++                           otherwise as blocks/s (directionally correct for
++                           OOM prediction even without block size).
++
++  preemption_rate        — Sequence preemptions per second.
++                           One preemption evicts all KV blocks for a sequence
++                           (N block evictions per preemption where N varies
++                           by sequence length). Distinct from eviction_rate.
++
++OTel spec: opentelemetry-specification/semantic-conventions#NNNN
++"""
++
++from __future__ import annotations
++
++import time
++from dataclasses import dataclass, field
++from typing import List, Optional
++
++from vllm.v1.metrics.stats import KVCacheEvictionEvent
++
++
++@dataclass(frozen=True)
++class KVCacheRates:
++    """Per-interval rate signals ready for Prometheus gauge.set()."""
++
++    # Block evictions per second (derived from KVCacheEvictionEvent list length)
++    eviction_rate: float
++
++    # KV cache growth in MB/s (positive = cache growing, 0.0 = stable/shrinking)
++    allocation_velocity_mbps: float
++
++    # Sequence preemptions per second
++    preemption_rate: float
++
++
++class KVCacheMetricsCollector:
++    """Compute rate signals from cumulative vLLM scheduler counters.
++
++    Called once per PrometheusStatLogger.record() invocation (every
++    scheduler step, typically every 1–5 s depending on request load).
++    Maintains running state across calls to compute finite differences.
++
++    Args:
++        total_gpu_blocks:  Total number of GPU KV cache blocks allocated
++                           at engine startup (from engine_config).
++        kv_block_size_mb:  Size of one KV cache block in MB.  When > 0,
++                           allocation_velocity is returned in MB/s.
++                           When 0.0, velocity is returned in blocks/s.
++    """
++
++    def __init__(
++        self,
++        total_gpu_blocks: int = 0,
++        kv_block_size_mb: float = 0.0,
++    ) -> None:
++        self._total_gpu_blocks   = total_gpu_blocks
++        self._kv_block_size_mb   = kv_block_size_mb
++        self._prev_usage_frac:   Optional[float] = None
++        self._prev_preemptions:  Optional[int]   = None
++        self._prev_ts:           float           = time.monotonic()
++
++    def update(
++        self,
++        kv_cache_usage_frac: float,
++        eviction_events: List[KVCacheEvictionEvent],
++        num_preemptions_delta: int,
++    ) -> KVCacheRates:
++        """Compute rates for the current scheduler step.
++
++        Args:
++            kv_cache_usage_frac:    Fraction of GPU KV cache blocks in use
++                                    (0.0–1.0).  From SchedulerStats.kv_cache_usage.
++            eviction_events:        List of KVCacheEvictionEvent from the
++                                    current scheduler step.  Length gives the
++                                    raw eviction count for this interval.
++            num_preemptions_delta:  Number of preemptions in this step.
++                                    From IterationStats (incremental, not
++                                    cumulative).
++
++        Returns:
++            KVCacheRates with all three signals >= 0.
++        """
++        now     = time.monotonic()
++        elapsed = max(now - self._prev_ts, 1e-6)   # guard zero-division on first call
++
++        # ---- eviction rate -----------------------------------------------
++        # len(eviction_events) is the number of block evictions in this step.
++        eviction_rate = len(eviction_events) / elapsed
++
++        # ---- allocation velocity -----------------------------------------
++        # delta usage fraction × total blocks × block size → MB/s
++        alloc_vel = 0.0
++        if self._prev_usage_frac is not None and self._total_gpu_blocks > 0:
++            delta_frac   = kv_cache_usage_frac - self._prev_usage_frac
++            delta_blocks = delta_frac * self._total_gpu_blocks
++            blocks_per_s = delta_blocks / elapsed
++            if self._kv_block_size_mb > 0:
++                alloc_vel = max(0.0, blocks_per_s * self._kv_block_size_mb)
++            else:
++                alloc_vel = max(0.0, blocks_per_s)   # blocks/s fallback
++
++        # ---- preemption rate ---------------------------------------------
++        preemption_rate = max(0, num_preemptions_delta) / elapsed
++
++        # Advance state
++        self._prev_usage_frac  = kv_cache_usage_frac
++        self._prev_ts          = now
++
++        return KVCacheRates(
++            eviction_rate=eviction_rate,
++            allocation_velocity_mbps=alloc_vel,
++            preemption_rate=preemption_rate,
++        )
++
++    @classmethod
++    def from_engine_config(cls, vllm_config: "VllmConfig") -> "KVCacheMetricsCollector":
++        """Construct from a VllmConfig — extracts block count and size."""
++        try:
++            cache_config      = vllm_config.cache_config
++            total_gpu_blocks  = getattr(cache_config, "num_gpu_blocks", 0) or 0
++            # block_size is in tokens; convert to MB using the model's KV dtype size.
++            # Approximation: 2 bytes/token (fp16) × num_heads × head_dim per layer.
++            # Falls back to 0.0 (blocks/s mode) if config is unavailable.
++            kv_block_size_mb  = getattr(cache_config, "block_size_bytes_approx_mb", 0.0)
++        except Exception:
++            total_gpu_blocks = 0
++            kv_block_size_mb = 0.0
++        return cls(
++            total_gpu_blocks=total_gpu_blocks,
++            kv_block_size_mb=kv_block_size_mb,
++        )
+
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index aaaaaaa..bbbbbbb 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+
+ import os
++import time
+ from abc import ABC, abstractmethod
+ from typing import TYPE_CHECKING, Optional
+
+@@ -20,6 +21,7 @@ from vllm.v1.metrics.stats import (IterationStats, KVCacheEvictionEvent,
+                                     PrefixCacheStats, SchedulerStats)
+ from vllm.v1.metrics.utils import local_interval_elapsed
+
++_OTEL_KV_METRICS_ENABLED = os.getenv("VLLM_OTEL_KV_METRICS_ENABLED", "").lower() in ("1", "true")
+
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
+@@ -100,6 +102,42 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+             name="vllm:num_preemptions",
+             documentation="Number of preemption requests.",
+             labelnames=["model_name", "engine"])
++
++        # ------------------------------------------------------------------
++        # OTel Gen AI KV cache semantic conventions
++        # opentelemetry-specification/semantic-conventions#NNNN
++        #
++        # Only registered when VLLM_OTEL_KV_METRICS_ENABLED=true to preserve
++        # zero-overhead behaviour for users who don't opt in.
++        # ------------------------------------------------------------------
++        self._gauge_kv_eviction_rate: Optional[prometheus_client.Gauge] = None
++        self._gauge_kv_allocation_velocity: Optional[prometheus_client.Gauge] = None
++        self._gauge_kv_preemption_rate: Optional[prometheus_client.Gauge] = None
++        self._kv_collector: Optional["KVCacheMetricsCollector"] = None
++
++        if _OTEL_KV_METRICS_ENABLED:
++            from vllm.v1.metrics.kv_metrics import KVCacheMetricsCollector
++            _kv_labels = ["model_name", "engine"]
++
++            self._gauge_kv_eviction_rate = prometheus_client.Gauge(
++                name="gen_ai_server_kv_cache_eviction_rate",
++                documentation=(
++                    "KV cache block eviction rate (evictions/s). "
++                    "OTel: gen_ai.server.kv_cache.eviction_rate"
++                ),
++                labelnames=_kv_labels)
++
++            self._gauge_kv_allocation_velocity = prometheus_client.Gauge(
++                name="gen_ai_server_kv_cache_allocation_velocity",
++                documentation=(
++                    "KV cache growth rate in MB/s (positive = growing). "
++                    "OTel: gen_ai.server.kv_cache.allocation_velocity_mbps"
++                ),
++                labelnames=_kv_labels)
++
++            self._gauge_kv_preemption_rate = prometheus_client.Gauge(
++                name="gen_ai_server_scheduler_preemption_rate",
++                documentation=(
++                    "Sequence preemption rate (preemptions/s). "
++                    "OTel: gen_ai.server.scheduler.preemption_rate"
++                ),
++                labelnames=_kv_labels)
++
++            self._kv_collector = KVCacheMetricsCollector.from_engine_config(vllm_config)
+
+     def record(
+         self,
+@@ -140,6 +178,28 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+             self.metrics_info.labels(
+                 model_name=model_name, engine=engine_label
+             ).set(scheduler_stats.kv_cache_usage)
++
++            # OTel KV cache rate signals
++            if self._kv_collector is not None:
++                _rates = self._kv_collector.update(
++                    kv_cache_usage_frac=scheduler_stats.kv_cache_usage,
++                    eviction_events=scheduler_stats.kv_cache_eviction_events,
++                    num_preemptions_delta=getattr(
++                        iteration_stats, "num_preemptions", 0
++                    ),
++                )
++                _lbl = dict(model_name=model_name, engine=engine_label)
++                self._gauge_kv_eviction_rate.labels(   # type: ignore[union-attr]
++                    **_lbl
++                ).set(_rates.eviction_rate)
++                self._gauge_kv_allocation_velocity.labels(  # type: ignore[union-attr]
++                    **_lbl
++                ).set(_rates.allocation_velocity_mbps)
++                self._gauge_kv_preemption_rate.labels(  # type: ignore[union-attr]
++                    **_lbl
++                ).set(_rates.preemption_rate)
+
+         if iteration_stats is not None:
+             # request-level histograms …
