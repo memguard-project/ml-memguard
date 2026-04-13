@@ -60,6 +60,7 @@ class TestInferenceTelemetry:
             "prefill_peak_activation_mb", "max_seq_len_in_flight",
             "memory_pressure_level", "page_fault_rate",
             "model_name", "backend", "os_platform", "oom_occurred",
+            "device_count", "reserved_vram_mb", "total_peak_mb",
         }
         assert expected_keys == set(d.keys())
 
