@@ -43,6 +43,13 @@ weights_mb / kvcache_mb / activations_mb / cuda_ctx_mb:
     Cross-layer GPU memory breakdown.  Required for accurate OOM prediction
     because KV-cache pressure interacts with the fixed weight footprint and
     CUDA context overhead.
+
+cuda_graph_mb:
+    CUDA graph reservation block in MB.  vLLM pre-captures CUDA graphs at
+    startup; the resulting allocation (typically 2–4 GB on A10G/A100) is
+    invisible to KV-utilization gauges.  Snapshotted once at engine startup
+    as ``torch.cuda.memory_reserved() − (weights_mb + kvcache_mb)``.
+    Zero means "not measured" (non-CUDA backend or PyTorch unavailable).
 """
 
 from __future__ import annotations
@@ -79,6 +86,9 @@ class InferenceTelemetry:
         GPU memory consumed by activation buffers.
     cuda_ctx_mb:
         GPU memory consumed by the CUDA context / driver overhead.
+    cuda_graph_mb:
+        CUDA graph reservation block in MB (snapshotted once at startup).
+        Zero when not measured.
     model_name:
         Serving model identifier (e.g. ``"meta-llama/Llama-3-8B-Instruct"``).
     backend:
@@ -97,6 +107,7 @@ class InferenceTelemetry:
     kvcache_mb:           float = 0.0
     activations_mb:       float = 0.0
     cuda_ctx_mb:          float = 0.0
+    cuda_graph_mb:        float = 0.0
     model_name:           str   = ""
     backend:              str   = ""
     os_platform:          str   = ""
@@ -118,6 +129,7 @@ class InferenceTelemetry:
             "kvcache_mb":           self.kvcache_mb,
             "activations_mb":       self.activations_mb,
             "cuda_ctx_mb":          self.cuda_ctx_mb,
+            "cuda_graph_mb":        self.cuda_graph_mb,
             "model_name":           self.model_name,
             "backend":              self.backend,
             "os_platform":          self.os_platform,

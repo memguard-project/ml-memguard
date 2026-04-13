@@ -200,6 +200,9 @@ class KVCacheMonitor:
         _PREDICTIVE_RESTART_COOLDOWN = 120.0   # module-level constant for tests
         self._predictive_restart_cooldown: float = _PREDICTIVE_RESTART_COOLDOWN
 
+        # CUDA graph memory baseline (PR 64) — snapshotted once at start()
+        self._cuda_graph_baseline_mb: float = 0.0
+
         # eBPF state (PR 35)
         self._use_ebpf: bool = use_ebpf
         self._ebpf_wake: threading.Event = threading.Event()
@@ -275,6 +278,9 @@ class KVCacheMonitor:
         self._last_oom_probability = 0.0
         self._stop.clear()
         self._ebpf_wake.clear()
+
+        # Snapshot CUDA graph reservation once at startup (best-effort)
+        self._snapshot_cuda_graph_baseline()
 
         # Load eBPF probes when requested (Linux + bcc only; silently skips otherwise)
         if self._use_ebpf:
@@ -421,6 +427,45 @@ class KVCacheMonitor:
                 exc,
             )
 
+    def _snapshot_cuda_graph_baseline(self) -> None:
+        """Snapshot the CUDA graph reservation block at engine startup.
+
+        Estimates the fixed overhead reserved by vLLM's CUDA graph capture
+        (typically 2–4 GB on A10G/A100) as::
+
+            reserved_mb − weights_mb − kvcache_mb
+
+        The result is stored in ``_cuda_graph_baseline_mb`` and included as a
+        static feature in every telemetry upload and OOM predict call.
+
+        Best-effort: silently skips if PyTorch is unavailable, CUDA is absent,
+        or the extended_poll_fn raises.  Zero means "not measured".
+        """
+        try:
+            import torch  # type: ignore[import]
+            if not torch.cuda.is_available():
+                return
+            reserved_mb = torch.cuda.memory_reserved() / (1024.0 * 1024.0)
+
+            extra: Dict[str, Any] = {}
+            if self._extended_poll_fn is not None:
+                try:
+                    extra = self._extended_poll_fn() or {}
+                except Exception:
+                    pass
+
+            weights_mb  = float(extra.get("weights_mb",  0.0))
+            kvcache_mb  = float(extra.get("kvcache_mb",  0.0))
+            baseline_mb = reserved_mb - weights_mb - kvcache_mb
+            self._cuda_graph_baseline_mb = max(0.0, baseline_mb)
+            logger.debug(
+                "[memory-guard] CUDA graph baseline: %.1f MB "
+                "(reserved=%.1f MB, weights=%.1f MB, kvcache=%.1f MB)",
+                self._cuda_graph_baseline_mb, reserved_mb, weights_mb, kvcache_mb,
+            )
+        except Exception as exc:
+            logger.debug("[memory-guard] CUDA graph snapshot skipped: %s", exc)
+
     def _run_predict_oom(
         self,
         kv_velocity: float,
@@ -456,6 +501,7 @@ class KVCacheMonitor:
                 "preemption_count":    int(extra.get("preemption_count", 0)),
                 "weights_mb":          float(extra.get("weights_mb", 0.0)),
                 "kvcache_mb":          float(extra.get("kvcache_mb", 0.0)),
+                "cuda_graph_mb":       float(extra.get("cuda_graph_mb", self._cuda_graph_baseline_mb)),
             }
 
             # Merge BPF-derived signals into the predict payload (PR 56)
@@ -576,6 +622,7 @@ class KVCacheMonitor:
                 kvcache_mb            = float(extra.get("kvcache_mb", 0.0)),
                 activations_mb        = float(extra.get("activations_mb", 0.0)),
                 cuda_ctx_mb           = float(extra.get("cuda_ctx_mb", 0.0)),
+                cuda_graph_mb         = float(extra.get("cuda_graph_mb", self._cuda_graph_baseline_mb)),
                 model_name            = self._telemetry_model_name,
                 backend               = self._telemetry_backend,
                 os_platform           = self._telemetry_os_platform,

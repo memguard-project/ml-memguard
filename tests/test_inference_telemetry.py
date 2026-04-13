@@ -2,7 +2,7 @@
 
 Covers:
   - InferenceTelemetry default construction (all fields zero)
-  - InferenceTelemetry.to_dict() includes all 14 keys + oom_occurred sentinel
+  - InferenceTelemetry.to_dict() includes all 15 keys + oom_occurred sentinel
   - KVCacheMonitor._compute_velocity(): cold start returns 0.0
   - KVCacheMonitor._compute_velocity(): correct blocks/s when block_size_mb == 0
   - KVCacheMonitor._compute_velocity(): correct MB/s when block_size_mb > 0
@@ -42,6 +42,7 @@ class TestInferenceTelemetry:
         assert t.kvcache_mb == 0.0
         assert t.activations_mb == 0.0
         assert t.cuda_ctx_mb == 0.0
+        assert t.cuda_graph_mb == 0.0
         assert t.model_name == ""
         assert t.backend == ""
         assert t.os_platform == ""
@@ -53,6 +54,8 @@ class TestInferenceTelemetry:
             "kv_velocity_mbps", "fragmentation_ratio", "eviction_rate",
             "avg_seq_len", "near_miss_count", "preemption_count",
             "weights_mb", "kvcache_mb", "activations_mb", "cuda_ctx_mb",
+            "cuda_graph_mb",
+            "memory_pressure_level", "page_fault_rate",
             "model_name", "backend", "os_platform", "oom_occurred",
         }
         assert expected_keys == set(d.keys())
@@ -243,6 +246,7 @@ class TestWorkerMissingFieldDefaulting:
             "kv_velocity_mbps", "fragmentation_ratio", "eviction_rate",
             "avg_seq_len", "near_miss_count", "preemption_count",
             "weights_mb", "kvcache_mb", "activations_mb", "cuda_ctx_mb",
+            "cuda_graph_mb",
         ):
             assert d[field] == 0 or d[field] == 0.0, f"{field} should default to 0"
 
@@ -254,3 +258,57 @@ class TestWorkerMissingFieldDefaulting:
         assert d["near_miss_count"] == 3
         assert d["fragmentation_ratio"] == 0.0
         assert d["eviction_rate"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# CUDA graph baseline
+# ---------------------------------------------------------------------------
+
+class TestCudaGraphBaseline:
+    def test_baseline_zero_when_torch_unavailable(self):
+        """_snapshot_cuda_graph_baseline silently skips if torch is not installed."""
+        import sys
+        import unittest.mock as mock
+
+        mon = KVCacheMonitor(poll_fn=lambda: (0, 100))
+        # Simulate torch import failure
+        with mock.patch.dict(sys.modules, {"torch": None}):
+            mon._snapshot_cuda_graph_baseline()
+        assert mon._cuda_graph_baseline_mb == 0.0
+
+    def test_baseline_emitted_in_telemetry_when_no_extended_poll(self):
+        """cuda_graph_mb in uploaded telemetry falls back to _cuda_graph_baseline_mb."""
+        captured: list = []
+        mon = KVCacheMonitor(
+            poll_fn=lambda: (50, 100),
+            telemetry_upload_interval=0.0,
+        )
+        mon._cuda_graph_baseline_mb = 2048.0  # inject a known baseline
+
+        with patch("memory_guard.backends.upload_inference_signals",
+                   side_effect=lambda s: captured.append(s) or True):
+            mon._upload_inference_telemetry(1.0)
+
+        assert len(captured) == 1
+        assert captured[0].cuda_graph_mb == pytest.approx(2048.0)
+
+    def test_extended_poll_cuda_graph_overrides_baseline(self):
+        """cuda_graph_mb from extended_poll_fn takes precedence over the baseline."""
+        captured: list = []
+
+        def extended():
+            return {"cuda_graph_mb": 3500.0}
+
+        mon = KVCacheMonitor(
+            poll_fn=lambda: (50, 100),
+            extended_poll_fn=extended,
+            telemetry_upload_interval=0.0,
+        )
+        mon._cuda_graph_baseline_mb = 2048.0  # baseline should be overridden
+
+        with patch("memory_guard.backends.upload_inference_signals",
+                   side_effect=lambda s: captured.append(s) or True):
+            mon._upload_inference_telemetry(1.0)
+
+        assert len(captured) == 1
+        assert captured[0].cuda_graph_mb == pytest.approx(3500.0)
