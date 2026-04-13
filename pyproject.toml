@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ml-memguard"
+version = "0.5.0"
+description = "Stop OOM crashes in vLLM, SGLang, Unsloth, and HuggingFace. Proactive memory estimation and runtime KV-cache monitoring for LLM inference serving and fine-tuning on Apple Silicon, CUDA, and CPU."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [{ name = "Guru Prasad Venkataraghavan", email = "vguruprasad91@gmail.com" }]
+keywords = [
+    "machine-learning", "memory", "oom", "apple-silicon", "cuda",
+    "training", "llm", "fine-tuning", "lora", "moe",
+    "inference", "vllm", "sglang", "kv-cache", "llm-serving",
+    "inference-server", "gpu-memory", "oom-prevention", "serving",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+cuda = ["torch>=2.0"]
+apple = ["mlx>=0.10"]
+hf = ["transformers>=4.30", "torch>=2.0", "accelerate>=1.1.0"]
+unsloth = ["unsloth", "transformers>=4.30", "torch>=2.0", "accelerate>=1.1.0"]
+vllm = ["vllm>=0.4"]
+sglang = ["sglang>=0.3"]
+sidecar = ["httpx>=0.24"]   # stdlib HTTP server
+ebpf = ["bcc", "libbpf-python"]  # Linux eBPF probes: bcc (primary) + libbpf-python (fallback)
+all = ["torch>=2.0", "mlx>=0.10", "psutil>=5.9", "transformers>=4.30", "vllm>=0.4", "sglang>=0.3"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "mypy>=1.0", "ruff>=0.1"]
+
+[project.scripts]
+memguard-sidecar    = "memory_guard.sidecar:main"
+memguard-efficiency = "memory_guard.cli.efficiency:main"
+
+[project.urls]
+Homepage = "https://github.com/memguard-project/ml-memguard"
+Repository = "https://github.com/memguard-project/ml-memguard"
+Issues = "https://github.com/memguard-project/ml-memguard/issues"
+Changelog = "https://github.com/memguard-project/ml-memguard/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["memory_guard"]
+include = ["memory_guard/data/gpu_tier_catalog.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100

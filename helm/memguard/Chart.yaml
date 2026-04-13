@@ -1,0 +1,25 @@
+apiVersion: v2
+name: memguard
+description: >
+  Proactive KV cache monitor and OOM prevention sidecar for vLLM / SGLang.
+  Exposes /healthz (liveness) and /readyz (readiness) so Kubernetes removes
+  a pod from the Service endpoint set before it runs out of memory — zero
+  code changes to your inference server required.
+type: application
+version: 0.1.0
+appVersion: "0.5.0"
+keywords:
+  - vllm
+  - sglang
+  - llm
+  - oom
+  - kv-cache
+  - mlops
+  - sidecar
+home: https://github.com/memguard-project/ml-memguard
+sources:
+  - https://github.com/memguard-project/ml-memguard
+maintainers:
+  - name: Guru Prasad Venkata Raghavan
+    url: https://github.com/vgpprasad91
+icon: https://raw.githubusercontent.com/memguard-project/ml-memguard/main/docs/logo.png
