@@ -1,0 +1,264 @@
+# OpenTelemetry Semantic Convention Registry
+# KV Cache Memory Pressure Signals for LLM Inference Servers
+#
+# This file follows the machine-readable YAML format defined by the OTel
+# semantic conventions toolchain (weaver / semconvgen).
+# Schema: https://github.com/open-telemetry/build-tools/blob/main/semantic-conventions/syntax.md
+#
+# Status: experimental
+# Namespace: gen_ai.server
+
+groups:
+  - id: gen_ai.server.kv_cache
+    type: attribute_group
+    brief: >
+      KV cache memory pressure signals for LLM inference servers.
+      These attributes describe the state of the key-value attention cache
+      managed by the inference engine's scheduler.
+    prefix: gen_ai.server.kv_cache
+    attributes:
+      - id: utilization
+        type: double
+        stability: experimental
+        brief: >
+          Fraction of KV cache blocks currently allocated.
+          Monotonically increases as requests are scheduled; drops as
+          sequences complete or are evicted.
+        note: >
+          Range [0.0, 1.0]. A value of 1.0 indicates the cache is fully
+          allocated; the scheduler will begin evicting sequences on new
+          arrivals. Implementations SHOULD emit this at every polling cycle.
+        requirement_level: recommended
+        examples: [0.0, 0.72, 1.0]
+
+      - id: allocation_velocity_mbps
+        type: double
+        stability: experimental
+        brief: >
+          Rate of KV cache growth in MB/s over the last polling interval.
+        note: >
+          Non-zero during active prefill; zero or negative when the cache
+          is stable or shrinking. A sustained high value indicates a
+          latency spike is imminent.
+        requirement_level: recommended
+        examples: [0.0, 128.5, 512.0]
+
+      - id: eviction_rate
+        type: double
+        stability: experimental
+        brief: >
+          Scheduler block evictions per second.
+        note: >
+          Non-zero at moderate utilisation indicates the engine is under
+          memory pressure and is preempting live sequences to free blocks.
+          Distinct from scheduler.preemption_rate: one preemption causes
+          N block evictions (N = sequence length / block_size).
+        requirement_level: recommended
+        examples: [0.0, 4.2, 100.0]
+
+      - id: fragmentation_ratio
+        type: double
+        stability: experimental
+        brief: >
+          Fraction of KV cache blocks that are allocated but not contiguous.
+        note: >
+          Range [0.0, 1.0]. Engines can OOM at less than 70% utilisation
+          when fragmentation prevents a single large contiguous allocation.
+          Requires internal block allocator accounting; not available in
+          all engines.
+        requirement_level: opt_in
+        examples: [0.0, 0.35, 1.0]
+
+  - id: gen_ai.server.memory
+    type: attribute_group
+    brief: >
+      OS-level and predictive memory pressure signals for LLM inference servers.
+    prefix: gen_ai.server.memory
+    attributes:
+      - id: pressure_level
+        type: double
+        stability: experimental
+        brief: >
+          OS-level cgroup memory pressure in megabytes above the configured
+          high-watermark.
+        note: >
+          Zero on systems without cgroup v2 `memory.high` support or without
+          the required Linux capabilities (CAP_BPF or equivalent).
+          A non-zero value means the kernel is already throttling the process.
+        requirement_level: opt_in
+        examples: [0.0, 512.0, 4096.0]
+
+      - id: oom_risk_score
+        type: double
+        stability: experimental
+        brief: >
+          Probability of an out-of-memory event in the next 30–120 seconds,
+          as estimated by an external predictive model.
+        note: >
+          Range [0.0, 1.0]. Zero when no predictive model is configured.
+          The model is trained on cross-fleet near-miss events; implementations
+          that do not integrate a predictive model SHOULD omit this attribute
+          rather than emitting 0.0.
+        requirement_level: opt_in
+        examples: [0.0, 0.45, 0.92]
+
+      - id: near_miss_count
+        type: int
+        stability: experimental
+        brief: >
+          Cumulative count of GPU memory allocations that succeeded with less
+          than the configured headroom remaining.
+        note: >
+          Counter semantics; resets on process restart. Zero without an
+          instrumented GPU memory allocator (e.g. memguard-allocator or
+          equivalent). A rising value at low kv_cache.utilization may indicate
+          non-KV memory pressure (model weights, activation buffers, CUDA
+          graphs).
+        requirement_level: opt_in
+        examples: [0, 14, 3002]
+
+  - id: gen_ai.server.scheduler
+    type: attribute_group
+    brief: >
+      Inference engine scheduler signals for LLM inference servers.
+    prefix: gen_ai.server.scheduler
+    attributes:
+      - id: preemption_rate
+        type: double
+        stability: experimental
+        brief: >
+          Scheduler request preemptions per second.
+        note: >
+          One preemption corresponds to evicting all KV cache blocks for a
+          single sequence and suspending it. Distinct from
+          gen_ai.server.kv_cache.eviction_rate: one preemption causes N
+          block evictions where N = (sequence token count / block_size).
+          A non-zero preemption rate at low kv_cache.utilization may indicate
+          memory fragmentation rather than capacity exhaustion.
+        requirement_level: recommended
+        examples: [0.0, 0.5, 12.0]
+
+# ---------------------------------------------------------------------------
+# Metric definitions
+# ---------------------------------------------------------------------------
+
+metrics:
+  - id: gen_ai.server.kv_cache.utilization
+    type: metric
+    metric_name: gen_ai.server.kv_cache.utilization
+    brief: KV cache block utilization
+    instrument: gauge
+    unit: "1"
+    stability: experimental
+    attributes:
+      - ref: gen_ai.server.kv_cache.utilization
+
+  - id: gen_ai.server.kv_cache.allocation_velocity
+    type: metric
+    metric_name: gen_ai.server.kv_cache.allocation_velocity
+    brief: KV cache growth rate in bytes per second
+    instrument: gauge
+    unit: "By/s"
+    stability: experimental
+    attributes:
+      - ref: gen_ai.server.kv_cache.allocation_velocity_mbps
+
+  - id: gen_ai.server.kv_cache.eviction_rate
+    type: metric
+    metric_name: gen_ai.server.kv_cache.eviction_rate
+    brief: Block eviction rate
+    instrument: gauge
+    unit: "{eviction}/s"
+    stability: experimental
+    attributes:
+      - ref: gen_ai.server.kv_cache.eviction_rate
+
+  - id: gen_ai.server.kv_cache.fragmentation_ratio
+    type: metric
+    metric_name: gen_ai.server.kv_cache.fragmentation_ratio
+    brief: KV cache block fragmentation
+    instrument: gauge
+    unit: "1"
+    stability: experimental
+    attributes:
+      - ref: gen_ai.server.kv_cache.fragmentation_ratio
+
+  - id: gen_ai.server.memory.pressure_level
+    type: metric
+    metric_name: gen_ai.server.memory.pressure_level
+    brief: Cgroup memory pressure above high-watermark
+    instrument: gauge
+    unit: "By"
+    stability: experimental
+    attributes:
+      - ref: gen_ai.server.memory.pressure_level
+
+  - id: gen_ai.server.memory.oom_risk_score
+    type: metric
+    metric_name: gen_ai.server.memory.oom_risk_score
+    brief: Predicted OOM probability in the next 30–120 s
+    instrument: gauge
+    unit: "1"
+    stability: experimental
+    attributes:
+      - ref: gen_ai.server.memory.oom_risk_score
+
+  - id: gen_ai.server.memory.near_miss_count
+    type: metric
+    metric_name: gen_ai.server.memory.near_miss_count
+    brief: Cumulative near-miss GPU memory allocations
+    instrument: updowncounter
+    unit: "{allocation}"
+    stability: experimental
+    attributes:
+      - ref: gen_ai.server.memory.near_miss_count
+
+  - id: gen_ai.server.scheduler.preemption_rate
+    type: metric
+    metric_name: gen_ai.server.scheduler.preemption_rate
+    brief: Sequence preemption rate
+    instrument: gauge
+    unit: "{preemption}/s"
+    stability: experimental
+    attributes:
+      - ref: gen_ai.server.scheduler.preemption_rate
+
+# ---------------------------------------------------------------------------
+# Event definitions
+# ---------------------------------------------------------------------------
+
+events:
+  - id: gen_ai.server.memory.pressure.warn
+    type: event
+    name: gen_ai.server.memory.pressure.warn
+    stability: experimental
+    brief: >
+      Elevated memory pressure; no traffic changes. Consumers SHOULD alert.
+    note: >
+      Triggered when oom_risk_score >= 0.50 or kv_cache.utilization >= 0.85.
+      The event body MUST include triggered_by (attribute name), value (double),
+      and threshold (double).
+
+  - id: gen_ai.server.memory.pressure.shed_load
+    type: event
+    name: gen_ai.server.memory.pressure.shed_load
+    stability: experimental
+    brief: >
+      OOM risk exceeds the load-shedding threshold. Readiness probe returns 503.
+    note: >
+      Triggered when oom_risk_score exceeds the configured shed_threshold
+      (default 0.70). The server's readiness endpoint (e.g. /readyz) SHOULD
+      return HTTP 503 until oom_risk_score drops below the hysteresis threshold.
+      Kubernetes will stop routing new requests to the pod.
+
+  - id: gen_ai.server.memory.pressure.critical_restart
+    type: event
+    name: gen_ai.server.memory.pressure.critical_restart
+    stability: experimental
+    brief: >
+      A watchdog is initiating a graceful restart sequence.
+    note: >
+      Triggered by an external watchdog (e.g. VLLMWatchdog) when OOM risk
+      is deemed unrecoverable without a restart. The pod will become
+      unavailable within approximately 60 seconds. Consumers SHOULD treat
+      this event as equivalent to a pod eviction for alerting purposes.
