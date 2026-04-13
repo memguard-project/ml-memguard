@@ -1,8 +1,6 @@
 # memory-guard
 
-**Stop `No available memory for cache blocks` in vLLM. Stop `CUDA out of memory` in Unsloth. Stop frozen Macs in mlx_lm. Works across inference serving and fine-tuning — and learns optimal configs from experience.**
-
-No more `gpu_memory_utilization` trial-and-error. No more KV cache crashes at 3 AM. No more wasted GPU-hours on jobs that OOM in the first minute.
+**memguard tells you that you're reserving 4×A10G but your true peak fits in 2×A10G 94% of the time, then books the right-sizing ticket automatically. OOM prevention is how it earns the trust to do that.**
 
 [![PyPI version](https://img.shields.io/pypi/v/ml-memguard.svg)](https://pypi.org/project/ml-memguard/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -21,6 +19,55 @@ pip install ml-memguard[cuda]           # + CUDA OOM recovery
 pip install ml-memguard[vllm]           # + vLLM inference serving adapter
 pip install ml-memguard[sglang]         # + SGLang inference serving adapter
 ```
+
+## Cost Optimization
+
+memguard watches your inference fleet's true memory footprint over a rolling window, computes the 94th-percentile peak per (source × model) pair, and tells you exactly which GPU tier you can safely downgrade to — and how much that saves per month.
+
+```
+$ memguard-efficiency --fleet
+
+SOURCE       MODEL            CURRENT      RECOMMENDS     P94 MB   WASTE   SAVINGS/MO   CONF
+──────────────────────────────────────────────────────────────────────────────────────────────
+prod-llm     mistral-7b       4×A10G       2×A10G         18,432    61%      $727/mo    HIGH
+batch-llm    llama-3-8b       2×A100-40    1×A100-40      34,102    57%      $495/mo    HIGH
+dev-serve    phi-3-mini       1×A10G       1×T4            5,218    44%      $212/mo    MED
+
+3 sources · fleet savings: $1,434/mo
+```
+
+### Quickstart — 3 commands to first insight
+
+```bash
+pip install ml-memguard
+export MEMGUARD_API_KEY=<your-key>  MEMGUARD_API_URL=https://<your-worker>.workers.dev
+memguard-efficiency --fleet
+```
+
+`MEMGUARD_API_URL` must point to your own deployed Worker — see [memguard-cloud/DEPLOYMENT.md](memguard-cloud/DEPLOYMENT.md).
+
+### CLI reference
+
+| Flag | Description |
+|------|-------------|
+| `--fleet` | Show all sources sorted by waste fraction (highest first) |
+| `--source-id SOURCE` | Filter output to a single source ID |
+| `--model MODEL` | Filter output to a specific model name |
+| `--lookback-days N` | Rolling window length in days (default: 30) |
+| `--json` | Output machine-readable JSON instead of a table |
+
+### Weekly Digest
+
+Register a Slack or Teams webhook and memguard-cloud fires it every Monday at 09:00 UTC whenever your fleet's total potential savings exceed $100 — a standing nudge to keep right-sizing tickets moving.
+
+```bash
+curl -X PUT "$MEMGUARD_API_URL/v1/settings/webhook" \
+  -H "Authorization: Bearer $MEMGUARD_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"webhook_url": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"}'
+```
+
+---
 
 ## The Problem
 
