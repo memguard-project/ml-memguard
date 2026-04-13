@@ -181,9 +181,13 @@ class MemGuardSidecar:
         self,
         monitor: "KVCacheMonitor",
         threshold: float = _DEFAULT_THRESHOLD,
+        headroom_threshold_mb: float = 0.0,
     ) -> None:
         self._monitor = monitor
         self._threshold = threshold
+        # PR 67: /readyz also returns 503 when true_available_headroom_mb is
+        # below this value.  0.0 (default) disables the headroom gate entirely.
+        self._headroom_threshold_mb: float = max(0.0, headroom_threshold_mb)
         self._server: Optional[http.server.HTTPServer] = None
 
     # ------------------------------------------------------------------
@@ -191,18 +195,42 @@ class MemGuardSidecar:
     # ------------------------------------------------------------------
 
     def _handle_readyz(self) -> Tuple[int, Dict]:
-        """Return (status_code, body) for the /readyz probe."""
-        p = self._monitor.last_oom_probability
-        if p > self._threshold:
+        """Return (status_code, body) for the /readyz probe.
+
+        Returns 503 (not ready) when either:
+          - ``oom_probability`` exceeds the OOM ``threshold``, OR
+          - ``true_available_headroom_mb`` is below ``headroom_threshold_mb``
+            and the headroom gate is enabled (threshold > 0).
+
+        The headroom gate catches weight/overhead OOMs that the probabilistic
+        model may not flag in time (PR 67).
+        """
+        p           = self._monitor.last_oom_probability
+        headroom_mb = self._monitor.last_true_available_headroom_mb
+        # float('inf') means "not yet received from /v1/predict" — skip gate
+        headroom_breach = (
+            self._headroom_threshold_mb > 0.0
+            and headroom_mb != float("inf")
+            and headroom_mb < self._headroom_threshold_mb
+        )
+        headroom_val: Optional[float] = (
+            round(headroom_mb, 1) if headroom_mb != float("inf") else None
+        )
+
+        if p > self._threshold or headroom_breach:
             return 503, {
-                "status":          "not_ready",
-                "oom_probability": round(p, 4),
-                "threshold":       self._threshold,
+                "status":                    "not_ready",
+                "oom_probability":           round(p, 4),
+                "threshold":                 self._threshold,
+                "true_available_headroom_mb": headroom_val,
+                "headroom_threshold_mb":     self._headroom_threshold_mb,
             }
         return 200, {
-            "status":          "ready",
-            "oom_probability": round(p, 4),
-            "threshold":       self._threshold,
+            "status":                    "ready",
+            "oom_probability":           round(p, 4),
+            "threshold":                 self._threshold,
+            "true_available_headroom_mb": headroom_val,
+            "headroom_threshold_mb":     self._headroom_threshold_mb,
         }
 
     # ------------------------------------------------------------------
@@ -385,6 +413,11 @@ def main() -> None:
                    help="Listen port for the sidecar server (default: 8001)")
     p.add_argument("--threshold",     type=float, default=_DEFAULT_THRESHOLD,
                    help="OOM probability above which /readyz returns 503 (default: 0.70)")
+    p.add_argument("--headroom-threshold-mb", type=float, default=0.0,
+                   dest="headroom_threshold_mb",
+                   help="Minimum true_available_headroom_mb below which /readyz returns 503 "
+                        "(default: 0 = disabled). Catches weight/overhead OOMs that the "
+                        "probabilistic model may miss.")
     p.add_argument("--poll-interval", type=float, default=5.0, dest="poll_interval",
                    help="Seconds between KV cache polls (default: 5.0)")
     p.add_argument("--model-name",    default="", dest="model_name",
@@ -405,7 +438,11 @@ def main() -> None:
         model_name    = args.model_name,
         backend       = args.backend,
     )
-    sidecar = MemGuardSidecar(monitor, threshold=args.threshold)
+    sidecar = MemGuardSidecar(
+        monitor,
+        threshold=args.threshold,
+        headroom_threshold_mb=args.headroom_threshold_mb,
+    )
 
     # Start MemGuardPolicy watcher for in-cluster hot-reload (no-op outside k8s)
     _policy_watcher = _start_policy_watcher(args.policy_name, sidecar, monitor)

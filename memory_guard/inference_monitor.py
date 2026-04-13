@@ -101,6 +101,9 @@ class KVCacheMonitor:
         # --- Prefill activation spike detection (PR 65) ---
         prefill_spike_threshold_mb: float = 512.0,
         vllm_metrics_url: str = "",
+        # --- Source baseline (PR 67) ---
+        source_id: str = "",
+        total_vram_mb: float = 0.0,
     ) -> None:
         """
         Args:
@@ -214,6 +217,13 @@ class KVCacheMonitor:
         # Latest value from vLLM /metrics scrape
         self._max_seq_len_in_flight: int        = 0
 
+        # Source baseline (PR 67) — posted once at start()
+        self._source_id: str            = source_id
+        self._total_vram_mb: float      = max(0.0, total_vram_mb)
+        # Last true_available_headroom_mb returned by /v1/predict.
+        # inf = "not yet received"; used by sidecar /readyz headroom gate.
+        self._last_true_available_headroom_mb: float = float("inf")
+
         # eBPF state (PR 35)
         self._use_ebpf: bool = use_ebpf
         self._ebpf_wake: threading.Event = threading.Event()
@@ -265,6 +275,18 @@ class KVCacheMonitor:
         """
         return self._last_oom_probability
 
+    @property
+    def last_true_available_headroom_mb(self) -> float:
+        """Most recent true available headroom (MB) returned by ``/v1/predict``.
+
+        Returns ``float('inf')`` until the first successful predict call that
+        includes source baseline data.  Read by the sidecar ``/readyz``
+        endpoint to trip 503 when headroom falls below the configured
+        ``headroom_threshold_mb`` — catching weight/overhead OOMs that the
+        probabilistic model may not flag in time (PR 67).
+        """
+        return self._last_true_available_headroom_mb
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -289,11 +311,15 @@ class KVCacheMonitor:
         self._last_oom_probability = 0.0
         self._prefill_peak_activation_mb = 0.0
         self._max_seq_len_in_flight = 0
+        self._last_true_available_headroom_mb = float("inf")
         self._stop.clear()
         self._ebpf_wake.clear()
 
         # Snapshot CUDA graph reservation once at startup (best-effort)
         self._snapshot_cuda_graph_baseline()
+
+        # PR 67: POST the startup memory footprint to the cloud (best-effort)
+        self._post_source_baseline()
 
         # Load eBPF probes when requested (Linux + bcc only; silently skips otherwise)
         if self._use_ebpf:
@@ -638,6 +664,8 @@ class KVCacheMonitor:
                 "cuda_graph_mb":              float(extra.get("cuda_graph_mb", self._cuda_graph_baseline_mb)),
                 "prefill_peak_activation_mb": self._prefill_peak_activation_mb,
                 "max_seq_len_in_flight":      self._max_seq_len_in_flight,
+                # PR 67: source_id routes the Worker to the correct baseline row
+                "source_id": self._source_id,
             }
 
             # Merge BPF-derived signals into the predict payload (PR 56)
@@ -670,6 +698,11 @@ class KVCacheMonitor:
             # PR 31: expose for sidecar /readyz probe
             self._last_oom_probability = p
 
+            # PR 67: cache headroom for sidecar /readyz headroom gate
+            headroom = result.get("true_available_headroom_mb")
+            if headroom is not None:
+                self._last_true_available_headroom_mb = float(headroom)
+
             logger.debug(
                 "[memory-guard] predict_oom: p=%.3f source=%s horizon=%s",
                 p, model_source, horizon,
@@ -696,6 +729,50 @@ class KVCacheMonitor:
 
         except Exception as exc:
             logger.debug("[memory-guard] _run_predict_oom raised: %s", exc)
+
+    def _post_source_baseline(self) -> None:
+        """POST the startup memory footprint to ``POST /v1/ingest/baseline``.
+
+        Called once in :meth:`start` after :meth:`_snapshot_cuda_graph_baseline`
+        so that ``_cuda_graph_baseline_mb`` is already populated.
+
+        Silently skips when no ``source_id`` is configured, no backend is
+        installed, or any step fails.
+        """
+        if not self._source_id:
+            return
+        try:
+            from .backends import upload_source_baseline as _upload_baseline
+
+            extra: Dict[str, Any] = {}
+            if self._extended_poll_fn is not None:
+                try:
+                    extra = self._extended_poll_fn() or {}
+                except Exception as exc:
+                    logger.debug(
+                        "[memory-guard] extended_poll_fn raised in _post_source_baseline: %s",
+                        exc,
+                    )
+
+            baseline = {
+                "source_id":     self._source_id,
+                "total_vram_mb": self._total_vram_mb,
+                "weights_mb":    float(extra.get("weights_mb",  0.0)),
+                "cuda_ctx_mb":   float(extra.get("cuda_ctx_mb", 0.0)),
+                "cuda_graph_mb": self._cuda_graph_baseline_mb,
+            }
+            _upload_baseline(baseline)
+            logger.debug(
+                "[memory-guard] Source baseline posted: source_id=%r "
+                "total_vram=%.0fMB weights=%.0fMB cuda_ctx=%.0fMB cuda_graph=%.0fMB",
+                self._source_id,
+                self._total_vram_mb,
+                baseline["weights_mb"],
+                baseline["cuda_ctx_mb"],
+                baseline["cuda_graph_mb"],
+            )
+        except Exception as exc:
+            logger.debug("[memory-guard] _post_source_baseline raised: %s", exc)
 
     def _compute_velocity(self, used_blocks: int, now: float) -> float:
         """Return KV cache growth rate.

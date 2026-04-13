@@ -49,6 +49,14 @@ class FleetBackend(Protocol):
         """Post a single inference monitoring cycle.  Returns True on success."""
         ...
 
+    def upload_source_baseline(self, baseline: Dict[str, Any]) -> bool:
+        """POST the startup memory snapshot to /v1/ingest/baseline.
+
+        Called once at KVCacheMonitor.start() after CUDA graph warmup.
+        Returns True on success.
+        """
+        ...
+
     def predict_oom(
         self,
         signals: Dict[str, Any],
@@ -169,6 +177,17 @@ def upload_inference_signals(signals: Any) -> bool:
         return False
     try:
         return b.upload_inference_signals(signals)
+    except Exception:
+        return False
+
+
+def upload_source_baseline(baseline: Dict[str, Any]) -> bool:
+    """POST the startup memory snapshot.  Returns False when no backend is installed."""
+    b = get_backend()
+    if b is None:
+        return False
+    try:
+        return b.upload_source_baseline(baseline)
     except Exception:
         return False
 
