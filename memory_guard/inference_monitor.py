@@ -571,9 +571,24 @@ class KVCacheMonitor:
         ``_max_seq_len_in_flight`` (latest value from vLLM /metrics).
 
         Primary path:
-            ``torch.cuda.memory_allocated() − (weights_mb + kvcache_mb + cuda_graph_mb)``
-            Only activated when ``kv_velocity > 0`` (KV cache is growing,
-            i.e. prefill is in progress) so we don't over-count stable phases.
+            Sum of ``torch.cuda.memory_allocated(i)`` across all
+            ``_device_count`` devices, minus
+            ``(weights_mb + kvcache_mb + cuda_graph_mb)``.
+            The sum is required for multi-GPU tensor-parallel pods where
+            allocation is distributed across devices; a single-device fast
+            path (``_device_count == 1``) skips the loop.
+            Only the prefill spike subtraction is gated on ``kv_velocity > 0``
+            (KV cache growing ⟹ prefill in progress).  The pool-wide
+            ``allocated_mb`` is recorded unconditionally as the interval peak
+            so it matches the ``reserved_vram_mb`` denominator used for
+            efficiency scoring.
+
+            Assumption for ``known_mb``: ``extended_poll_fn`` is expected to
+            return *pool-wide* totals for multi-GPU deployments (e.g. vLLM
+            reports total KV-cache blocks across the tensor-parallel group,
+            not per-shard).  If a custom ``extended_poll_fn`` returns
+            per-device values instead, multiply each component by
+            ``self._device_count`` before the subtraction.
 
         eBPF fallback (Linux, no PyTorch):
             If ``mmap_growth_mb`` in this poll interval exceeds the expected
@@ -597,15 +612,27 @@ class KVCacheMonitor:
             prefill_mb   = 0.0
             torch_ok     = False
 
-            # --- primary: torch.cuda.memory_allocated() overhead -----------
+            # --- primary: pool-wide torch.cuda.memory_allocated() -----------
             try:
                 import torch  # type: ignore[import]
                 if torch.cuda.is_available():
-                    allocated_mb = torch.cuda.memory_allocated() / (1024.0 * 1024.0)
+                    # PR 74: sum across all visible devices so allocated_mb is
+                    # pool-wide and matches the reserved_vram_mb denominator
+                    # (PR 72).  Single-GPU fast path avoids the loop overhead.
+                    if self._device_count > 1:
+                        allocated_mb = sum(
+                            torch.cuda.memory_allocated(i)
+                            for i in range(self._device_count)
+                        ) / (1024.0 * 1024.0)
+                    else:
+                        allocated_mb = torch.cuda.memory_allocated() / (1024.0 * 1024.0)
+
                     # PR 68: unconditionally update the interval peak (all phases)
                     if allocated_mb > self._total_peak_mb:
                         self._total_peak_mb = allocated_mb
                     if kv_velocity > 0:
+                        # known_mb assumes extended_poll_fn returns pool-wide
+                        # totals — see docstring for per-device caveat.
                         known_mb   = weights_mb + kvcache_mb + cuda_graph_mb
                         prefill_mb = max(0.0, allocated_mb - known_mb)
                     torch_ok = True
