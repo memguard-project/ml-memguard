@@ -8,7 +8,8 @@ monitored source/model pair.
 Authentication
 --------------
 Set MEMGUARD_API_KEY (or the legacy MEMGUARD_BACKEND_KEY) to your API key.
-Set MEMGUARD_API_URL to override the default production endpoint.
+Set MEMGUARD_API_URL to the URL of your deployed memguard-cloud Worker.
+Both variables are required; the CLI exits with code 1 if either is absent.
 
 Usage
 -----
@@ -50,9 +51,6 @@ from typing import Any, Dict, List, Optional
 # Config helpers
 # ---------------------------------------------------------------------------
 
-_DEFAULT_API_URL = "https://memguard-api.vgpprasad91.workers.dev"
-
-
 def _get_api_key() -> str:
     return (
         os.environ.get("MEMGUARD_API_KEY", "")
@@ -61,7 +59,7 @@ def _get_api_key() -> str:
 
 
 def _get_api_url() -> str:
-    return os.environ.get("MEMGUARD_API_URL", _DEFAULT_API_URL).rstrip("/")
+    return os.environ.get("MEMGUARD_API_URL", "").rstrip("/")
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +231,12 @@ def main() -> None:
         help="Filter output to a single model_name (substring match on the client side).",
     )
     args = parser.parse_args()
+
+    if not os.environ.get("MEMGUARD_API_URL"):
+        sys.exit(
+            "Error: MEMGUARD_API_URL is not set. "
+            "Deploy the Worker (see memguard-cloud/DEPLOYMENT.md) and export the URL."
+        )
 
     lookback = max(1, min(90, args.lookback_days))
     params   = {"lookback_days": str(lookback)}
