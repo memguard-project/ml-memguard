@@ -40,11 +40,13 @@ with safe.monitor.session():
     server.serve_forever()
 ```
 
+After a few days of serving traffic, run `memguard-efficiency --fleet` to see your first right-sizing recommendation — no additional setup required.
+
 ---
 
 ## Cost Optimization
 
-Once your Worker is deployed and `MEMGUARD_API_URL` is set, memguard watches your inference fleet's true memory footprint over a rolling window, computes the 94th-percentile peak per (source × model) pair, and tells you exactly which GPU tier you can safely downgrade to — and how much that saves per month.
+By default, memguard watches your local inference fleet's true memory footprint over a rolling window, computes the 94th-percentile peak per (source × model) pair, and tells you exactly which GPU tier you can safely downgrade to — and how much that saves per month.
 
 ```
 $ memguard-efficiency --fleet
@@ -60,12 +62,22 @@ dev-serve    phi-3-mini       1×A10G       1×T4            5,218    44%      $
 
 ### Quickstart
 
-> Steps 2–3 require a deployed memguard-cloud Worker — complete [memguard-cloud/DEPLOYMENT.md](memguard-cloud/DEPLOYMENT.md) first, then return here.
+#### Local — single machine, zero setup
+
+Local mode works with no API key and no Cloudflare account — after `guard_vllm` has been running for a few days, `memguard-efficiency --fleet` reads from `~/.memory-guard/telemetry.db` automatically.
 
 ```bash
-pip install ml-memguard
-export MEMGUARD_API_KEY=<your-key>  MEMGUARD_API_URL=https://<your-worker>.workers.dev
-memguard-efficiency --fleet
+pip install ml-memguard[vllm]   # already done if you followed the OOM Prevention Quickstart
+memguard-efficiency --fleet     # reads local telemetry; no env vars needed
+```
+
+#### Cloud — multi-machine fleet
+
+Set `MEMGUARD_API_URL` and `MEMGUARD_API_KEY` to aggregate telemetry across all your machines, unlock the weekly Slack digest, and query the hosted fleet endpoint. See [memguard-cloud/DEPLOYMENT.md](memguard-cloud/DEPLOYMENT.md) to deploy your own Worker.
+
+```bash
+export MEMGUARD_API_URL=https://<your-worker>.workers.dev  MEMGUARD_API_KEY=<your-key>
+memguard-efficiency --fleet     # now aggregates across all machines
 ```
 
 ### CLI reference
@@ -77,8 +89,11 @@ memguard-efficiency --fleet
 | `--model MODEL` | Filter output to a specific model name |
 | `--lookback-days N` | Rolling window length in days (default: 30) |
 | `--json` | Output machine-readable JSON instead of a table |
+| `--local` | Force local mode even when `MEMGUARD_API_URL` is set |
 
 ### Weekly Digest
+
+> Requires `MEMGUARD_API_URL` — cloud mode only.
 
 Register a Slack or Teams webhook and memguard-cloud fires it every Monday at 09:00 UTC whenever your fleet's total potential savings exceed $100 — a standing nudge to keep right-sizing tickets moving.
 
