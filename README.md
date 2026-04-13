@@ -64,6 +64,15 @@ thread and fires your callback — the server keeps running, your load balancer 
 See the [full quick-start guide](docs/quickstart/vllm.md) for the before/after terminal output, CLI
 usage, Kubernetes sidecar setup, and common troubleshooting.
 
+### Collect KV Cache Telemetry via OTel Collector
+
+Route your vLLM KV cache signals to memguard-cloud through the OpenTelemetry Collector with a single
+pipeline addition — no code changes to your inference server. Set `VLLM_OTEL_KV_METRICS_ENABLED=true`
+and point your collector's `otlphttp` exporter at `https://api.memguard.io/v1/ingest/otlp` with your
+memguard API key in the `Authorization` header. See the
+[OTel Collector integration guide](docs/integrations/otel-collector.md) for the complete
+copy-paste config snippet and verification steps.
+
 ---
 
 ## The Solution

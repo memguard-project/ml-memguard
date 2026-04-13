@@ -1,0 +1,131 @@
+# OTel Collector config snippet — memguard KV cache telemetry pipeline
+#
+# Receives OTLP metrics from vLLM (or any OTel-instrumented inference server),
+# filters to the three GBT-wired KV cache signals, and forwards them to the
+# memguard-cloud ingest endpoint.
+#
+# Requirements:
+#   - OpenTelemetry Collector Contrib ≥ 0.96.0
+#     (filter processor with strict match_type is in otelcol-contrib, not core)
+#   - MEMGUARD_API_KEY env var set to your memguard API key
+#   - vLLM ≥ 0.4.0 with VLLM_OTEL_KV_METRICS_ENABLED=true
+#     (or any OTel emitter that produces gen_ai.server.* metrics)
+#
+# Usage:
+#   otelcol-contrib --config otelcol-mkcp.yaml
+#
+# Full integration guide: docs/integrations/otel-collector.md
+
+# ---------------------------------------------------------------------------
+# Receivers — accept OTLP from any inference server on the local network
+# ---------------------------------------------------------------------------
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317      # gRPC — default OTLP port
+      http:
+        endpoint: 0.0.0.0:4318      # HTTP — default OTLP/HTTP port
+        cors:
+          allowed_origins: ["*"]
+
+# ---------------------------------------------------------------------------
+# Processors — keep only the three GBT-wired signals; drop everything else.
+#
+# This prevents sending unrelated metrics (request latency histograms,
+# token counts, HTTP server metrics) to the memguard ingest endpoint, which
+# only extracts the three MKCP-wired names anyway.  Filtering here reduces
+# egress bytes and keeps the ingest endpoint response times low.
+# ---------------------------------------------------------------------------
+
+processors:
+  # Drop any metric NOT in the MKCP-wired set
+  filter/mkcp_signals:
+    error_mode: ignore
+    metrics:
+      include:
+        match_type: strict
+        metric_names:
+          - "gen_ai.server.kv_cache.eviction_rate"
+          - "gen_ai.server.kv_cache.allocation_velocity_mbps"
+          - "gen_ai.server.scheduler.preemption_rate"
+
+  # Add collector host resource attributes for fleet-level attribution
+  resourcedetection/system:
+    detectors: [system, docker, k8snode]
+    timeout: 5s
+    override: false
+
+  # Batch to reduce HTTP round-trips; flush every 10 s or when 512 metrics queued
+  batch/mkcp:
+    send_batch_size: 512
+    timeout: 10s
+
+# ---------------------------------------------------------------------------
+# Exporters — forward to memguard-cloud /v1/ingest/otlp
+#
+# The endpoint uses metrics_endpoint (not endpoint) so the collector does
+# NOT append /v1/metrics — our path /v1/ingest/otlp is used verbatim.
+#
+# Authorization: set MEMGUARD_API_KEY in the environment or in a secrets
+# manager and reference it as ${env:MEMGUARD_API_KEY}.
+# ---------------------------------------------------------------------------
+
+exporters:
+  otlphttp/memguard:
+    metrics_endpoint: https://api.memguard.io/v1/ingest/otlp
+    headers:
+      Authorization: "Bearer ${env:MEMGUARD_API_KEY}"
+    compression: gzip
+    timeout: 10s
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 1000       # buffer up to 1000 batches if the endpoint is slow
+      storage: file_storage/queue
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 60s
+      max_elapsed_time: 300s
+
+  # Optional: keep a local Prometheus scrape endpoint for dashboarding
+  # alongside forwarding to memguard. Remove if not needed.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: memguard
+
+# ---------------------------------------------------------------------------
+# Extensions
+# ---------------------------------------------------------------------------
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # Persistent queue storage so in-flight batches survive collector restarts
+  file_storage/queue:
+    directory: /var/otelcol/queue
+    timeout: 10s
+
+# ---------------------------------------------------------------------------
+# Service — wire the pipeline
+# ---------------------------------------------------------------------------
+
+service:
+  extensions: [health_check, file_storage/queue]
+
+  pipelines:
+    metrics/mkcp:
+      receivers:  [otlp]
+      processors: [resourcedetection/system, filter/mkcp_signals, batch/mkcp]
+      exporters:  [otlphttp/memguard]
+
+  # Collector's own telemetry — useful for debugging queue depth and drop rate
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: basic
+      address: 0.0.0.0:8888
