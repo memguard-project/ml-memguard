@@ -22,7 +22,7 @@ pip install ml-memguard[sglang]         # + SGLang inference serving adapter
 
 ## OOM Prevention Quickstart
 
-No API key. No extra service. Works on first install.
+No extra setup. Works on first install.
 
 ```bash
 pip install ml-memguard[vllm]
@@ -46,7 +46,7 @@ After a few days of serving traffic, run `memguard-efficiency --fleet` to see yo
 
 ## Cost Optimization
 
-By default, memguard watches your local inference fleet's true memory footprint over a rolling window, computes the 94th-percentile peak per (source × model) pair, and tells you exactly which GPU tier you can safely downgrade to — and how much that saves per month.
+By default, memguard watches your local telemetry over a rolling window, computes the 94th-percentile peak per (source × model) pair, and tells you exactly which GPU tier you can safely downgrade to — and how much that saves per month.
 
 ```
 $ memguard-efficiency --fleet
@@ -62,7 +62,7 @@ dev-serve    phi-3-mini       1×A10G       1×T4            5,218    44%      $
 
 ### Quickstart
 
-Local mode works with no API key and no extra service. After `guard_vllm` has been running for a few days, `memguard-efficiency --fleet` reads from `~/.memory-guard/telemetry.db` automatically.
+Local mode works with no extra service. After `guard_vllm` has been running for a few days, `memguard-efficiency --fleet` reads directly from `~/.memory-guard/telemetry.db`.
 
 ```bash
 pip install ml-memguard[vllm]   # already done if you followed the OOM Prevention Quickstart
@@ -632,6 +632,26 @@ The estimation formula is based on published research (FlashAttention, HyC-LoRA,
 - **MLX Metal thread safety**: `mx.metal.get_active_memory()` is called from a background thread. MLX's Metal backend has [known thread safety limitations](https://github.com/ml-explore/mlx/issues/2133). Memory counter reads work in practice but aren't guaranteed thread-safe by the MLX API.
 - **Windows**: CUDA path uses well-tested `torch.cuda` APIs. The CPU-only fallback (`GlobalMemoryStatusEx`) hasn't been validated across Windows versions.
 
+## Repository layout
+
+```
+ml-memguard/
+├── memory_guard/          # Python library (Apache 2.0)
+│   ├── estimation/        #   preflight: estimator, downgrade
+│   ├── monitoring/        #   runtime: inference_monitor, monitor, platforms
+│   ├── adaptation/        #   learning: bandit, calibration, reward
+│   ├── deployment/        #   infra: watchdog, sidecar, k8s_policy
+│   ├── adapters/          #   framework adapters: HF, Unsloth, vLLM, SGLang
+│   ├── ebpf/              #   eBPF probes (Linux/Kubernetes)
+│   └── cli/               #   memguard-efficiency CLI
+├── tests/                 # pytest suite (781 tests)
+├── bench/                 # reproducible benchmark scripts
+├── examples/              # runnable integration examples
+├── helm/                  # Kubernetes Helm chart
+├── paper/                 # arXiv draft + build tooling
+└── docs/                  # user-facing reference docs + ADRs
+```
+
 ## Contributing
 
 ### Help Us Benchmark
@@ -648,11 +668,17 @@ python bench/bench_accuracy.py
 # Run with a specific model
 python bench/bench_accuracy.py --model mlx-community/Mistral-7B-Instruct-v0.3-4bit
 
+# Save a reproducible artifact
+python bench/bench_accuracy.py \
+  --model mlx-community/Qwen3.5-9B-MLX-4bit \
+  --output-json bench/results/qwen3.5-9b.json
+
 # Generate a pre-formatted GitHub issue with your results
 python bench/bench_accuracy.py --model mlx-community/Qwen3.5-9B-MLX-4bit --submit
 ```
 
 Then open a [GitHub issue](https://github.com/memguard-project/ml-memguard/issues/new) with the output. We'll add your results to the accuracy table above.
+For the paper artifact workflow, see [`bench/README.md`](bench/README.md).
 
 **Devices we especially need data from**:
 - M1/M2 MacBook Air (8GB, 16GB)
