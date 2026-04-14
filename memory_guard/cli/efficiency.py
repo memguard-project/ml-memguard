@@ -6,7 +6,7 @@ P94 peak, waste percentage, and estimated monthly savings for each
 monitored source/model pair.
 
 The report is built entirely from local telemetry accumulated by
-``KVCacheMonitor``. No API key or remote service is required.
+``KVCacheMonitor``. No external service is required.
 
 Usage
 -----

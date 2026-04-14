@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+title: "memory-guard"
+message: "If you use this software or benchmark artifact, please cite the repository."
+type: software
+authors:
+  - family-names: "Venkataraghavan"
+    given-names: "Guru Prasad"
+repository-code: "https://github.com/memguard-project/ml-memguard"
+license: "Apache-2.0"
+version: "0.5.0"
+date-released: "2026-04-11"
+abstract: >
+  Local-first proactive memory safety for LLM fine-tuning and inference serving,
+  with benchmark artifacts for estimation accuracy and runtime monitoring.

@@ -2,7 +2,7 @@
 
 All probes (cgroup memory, preemption, page fault, mmap) write into a single
 :class:`MemguardBPFEvent` wire format so downstream consumers — VLLMWatchdog,
-KVCacheMonitor, the cloud telemetry uploader — never need to know which probe
+KVCacheMonitor, and optional backend exporters — never need to know which probe
 generated a given signal.
 """
 

@@ -101,7 +101,7 @@ Existing solutions (PyTorch Lightning BatchSizeFinder, HuggingFace `accelerate`)
 
 ## Quick-Start
 
-**→ [vLLM: stop KV cache crashes in 3 minutes](docs/quickstart/vllm.md)**
+**→ [vLLM: stop KV cache crashes in 3 minutes](https://github.com/memguard-project/memguard-docs/blob/main/quickstart/vllm.md)**
 
 ```bash
 pip install ml-memguard[vllm]
@@ -432,7 +432,7 @@ trainer.train()
 *New in v0.2.0* — adapters read the model's architecture automatically so you
 don't have to look up `hidden_size`, `num_heads`, or `num_layers`.
 Inference serving adapters added in v0.3.0; RL optimizer integrated in v0.4.0.
-Full reference: [`docs/adapters.md`](docs/adapters.md).
+Full reference: [`memguard-docs/adapters.md`](https://github.com/memguard-project/memguard-docs/blob/main/adapters.md).
 
 ### How model introspection works
 
@@ -542,7 +542,7 @@ unseen entries).
 Convenience constructor for use with `BanditPolicy.q_value()` and
 `BanditPolicy.update()` directly.
 
-Full reference: [`docs/rl_optimizer.md`](docs/rl_optimizer.md).
+Full reference: [`memguard-docs/rl_optimizer.md`](https://github.com/memguard-project/memguard-docs/blob/main/rl_optimizer.md).
 
 ### Fine-Tuning Adapters (v0.2, `pip install ml-memguard[hf]`)
 
@@ -634,6 +634,16 @@ The estimation formula is based on published research (FlashAttention, HyC-LoRA,
 
 ## Repository layout
 
+This repo contains only the core Python library. The project spans five repos:
+
+| Repo | Description |
+|------|-------------|
+| **[ml-memguard](https://github.com/memguard-project/ml-memguard)** | Core Python library (this repo) |
+| **[memguard-docs](https://github.com/memguard-project/memguard-docs)** | User-facing reference docs + ADRs |
+| **[memguard-examples](https://github.com/memguard-project/memguard-examples)** | Runnable integration examples |
+| **[memguard-helm](https://github.com/memguard-project/memguard-helm)** | Kubernetes Helm chart |
+| **[memguard-paper](https://github.com/memguard-project/memguard-paper)** | arXiv draft + benchmark artifacts |
+
 ```
 ml-memguard/
 ├── memory_guard/          # Python library (Apache 2.0)
@@ -644,12 +654,7 @@ ml-memguard/
 │   ├── adapters/          #   framework adapters: HF, Unsloth, vLLM, SGLang
 │   ├── ebpf/              #   eBPF probes (Linux/Kubernetes)
 │   └── cli/               #   memguard-efficiency CLI
-├── tests/                 # pytest suite (781 tests)
-├── bench/                 # reproducible benchmark scripts
-├── examples/              # runnable integration examples
-├── helm/                  # Kubernetes Helm chart
-├── paper/                 # arXiv draft + build tooling
-└── docs/                  # user-facing reference docs + ADRs
+└── tests/                 # pytest suite (781 tests)
 ```
 
 ## Contributing
@@ -661,6 +666,10 @@ The single most valuable contribution right now is **running the benchmark on yo
 ```bash
 # Install
 pip install ml-memguard mlx-lm
+
+# Clone the benchmark repo
+git clone https://github.com/memguard-project/memguard-paper
+cd memguard-paper
 
 # Run with default small model (fast, ~2 minutes)
 python bench/bench_accuracy.py
@@ -678,7 +687,7 @@ python bench/bench_accuracy.py --model mlx-community/Qwen3.5-9B-MLX-4bit --submi
 ```
 
 Then open a [GitHub issue](https://github.com/memguard-project/ml-memguard/issues/new) with the output. We'll add your results to the accuracy table above.
-For the paper artifact workflow, see [`bench/README.md`](bench/README.md).
+For the paper artifact workflow, see [`memguard-paper/bench/README.md`](https://github.com/memguard-project/memguard-paper/blob/main/bench/README.md).
 
 **Devices we especially need data from**:
 - M1/M2 MacBook Air (8GB, 16GB)

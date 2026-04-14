@@ -94,21 +94,21 @@ These are the gaps in the current Supported Hardware matrix:
 To get a pre-formatted report with estimated vs actual memory:
 
 ```bash
-pip install ml-memguard
-
-# Inference benchmark
-python bench/bench_accuracy.py --framework vllm
-
-# Training benchmark (Apple Silicon)
 pip install ml-memguard mlx-lm
-python bench/bench_accuracy.py --framework mlx_lm
+python bench/bench_accuracy.py
 
 # With a specific model
 python bench/bench_accuracy.py --model mlx-community/Qwen3.5-9B-MLX-4bit --submit
+
+# Save a reproducible artifact for the paper / benchmark repo
+python bench/bench_accuracy.py \
+  --model mlx-community/Qwen3.5-9B-MLX-4bit \
+  --output-json bench/results/qwen3.5-9b.json
 ```
 
 The `--submit` flag generates a pre-formatted GitHub issue body. Copy it, open
 a new issue at https://github.com/memguard-project/ml-memguard/issues/new, and paste.
+For the full artifact workflow, see [`bench/README.md`](bench/README.md).
 
 ---
 

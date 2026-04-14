@@ -1,6 +1,0 @@
-# Patterns to ignore when building packages.
-.DS_Store
-*.tgz
-*.lock
-.git/
-.github/

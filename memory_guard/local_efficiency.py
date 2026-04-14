@@ -1,13 +1,13 @@
 """Local efficiency report computed from ~/.memory-guard/telemetry.db.
 
-No cloud credentials required.  Works entirely with telemetry accumulated
-by KVCacheMonitor._write_local_telemetry (PR 79).
+Works entirely with telemetry accumulated by
+KVCacheMonitor._write_local_telemetry (PR 79).
 
 Public API
 ----------
 compute_local_efficiency_report(lookback_days, source_id_filter, model_filter)
     Returns {"sources": [...], "total_estimated_monthly_savings_usd": N}
-    with the identical dict shape the cloud API returns, or None when no
+    with the same dict shape used by optional backend integrations, or None when no
     local database exists yet.
 """
 
@@ -169,7 +169,7 @@ def compute_local_efficiency_report(
         When the local database does not exist — caller should print a hint.
     dict
         ``{"sources": [...], "total_estimated_monthly_savings_usd": N}``
-        with the identical shape the cloud API returns, suitable for direct
+        with the same response shape used by optional backend integrations, suitable for direct
         use by the CLI's ``_print_table`` and JSON output paths.
     """
     db = LocalTelemetryDB(db_path)
